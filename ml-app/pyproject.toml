@@ -1,0 +1,111 @@
+[project]
+name = "ml-app"
+version = "0.1.0"
+description = "Production-ready Machine Learning FastAPI microservice. Demonstrates big-API structure, optional feature gating, and clean separation between the web layer and the ML library (churn-lib)."
+readme = "README.md"
+requires-python = "~=3.12.0"
+dependencies = [
+    # churn-lib[predict] pulls in only the inference deps (pandas, numpy, sklearn, xgboost).
+    # The heavy training deps (mlflow, matplotlib) are NOT installed — keeping this
+    # process lean and safe for production inference workloads.
+    "churn-lib[predict]",
+    "fastapi>=0.115.0",
+    "pydantic-settings>=2.0",
+    "uvicorn[standard]>=0.32.0",
+]
+
+[project.optional-dependencies]
+# Install with:  uv sync --extra train
+#                pip install ml-app[train]
+#
+# This pulls in churn-lib[train] (adds mlflow + matplotlib) and enables the
+# POST /api/v1/churn/train endpoints. Without this extra those routes return
+# 404 and the heavy deps are never imported — the inference process stays lean.
+#
+# To split into two separate services (Option B — recommended for high-traffic
+# production):
+#   1. Move app/api/v1/endpoints/churn/train.py into a new FastAPI app.
+#   2. Deploy it internally; keep this app inference-only.
+#   3. Both share the same churn-lib; only the web layer changes.
+train = ["churn-lib[train]"]
+
+[dependency-groups]
+# Install with:  uv sync --group dev
+# These packages are only needed for development — they are never installed in
+# the production Docker image (uv sync --no-dev is used there).
+dev = [
+    # Test runner and parallelism
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",  # asyncio_mode = "auto" in pyproject.toml
+    "pytest-xdist>=3.5",     # -n auto parallel execution
+    # FastAPI / ASGI test client — httpx is required by Starlette's TestClient
+    "httpx>=0.27",
+    # anyio backend for async tests (used by pytest-asyncio under the hood)
+    "anyio[trio]>=4.0",
+    "ruff",
+    "taskipy>=1.14.0",
+]
+
+[tool.uv.sources]
+churn-lib = { path = "../churn-lib", editable = true }
+
+[project.scripts]
+# Expose the churn-lib trainer CLI when this package is installed.
+# Only works when the [train] extra is installed (churn-lib[train] provides the entry point).
+trainer = "churn_lib.trainer:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+# ml-app is deployed as a service (run via uvicorn), not published as a library.
+# The build target is kept for completeness — the package lives in app/, not src/.
+packages = ["app"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["A", "B", "C", "E", "F", "W", "I", "UP", "FURB", "RUF", "PD"]
+exclude = [".venv"]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "C901",   # function complexity — intentionally not limited
+    "B008",   # Depends() in argument defaults — this is the standard FastAPI DI pattern;
+              # FastAPI intercepts these at startup, they are never called as regular defaults
+    "RUF001", # ambiguous unicode in string literals — EN DASH used intentionally in range notation
+    "RUF002", # ambiguous unicode in docstrings — EN DASH used intentionally in range notation
+    "RUF003", # ambiguous unicode in comments — EN DASH used intentionally in range notation
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+ignore-overlong-task-comments = true
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.taskipy.tasks]
+precommit = { cmd = "uvx ruff format . && uvx ruff check . --fix --unsafe-fixes && uvx pyright .", help = "Lint, format and typecheck Python codebase" }
+test = { cmd = "pytest", help = "Run the full test suite in parallel" }
+test-cov = { cmd = "pytest --cov=churn_lib --cov-report=term-missing", help = "Run tests with coverage report" }
+# mlflow = { cmd = "docker compose up -d && echo 'MLflow UI: http://localhost:5000'", help = "Start local MLflow tracking server" }
+# mlflow-stop = { cmd = "docker compose down", help = "Stop local MLflow tracking server" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-n auto --dist loadscope --tb=short"

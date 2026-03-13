@@ -1,0 +1,88 @@
+[project]
+name = "churn-lib"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "~=3.12.0"
+# No mandatory runtime deps — callers install the extras they need.
+dependencies = []
+
+[project.optional-dependencies]
+# Minimal set for loading a saved pipeline and running inference.
+# Install with: uv add "churn-lib[predict]"
+predict = [
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "xgboost",
+    "pyyaml",
+]
+# Everything needed to train, evaluate, and save a pipeline.
+# Install with: uv add "churn-lib[train]"
+train = [
+    "churn-lib[predict]",
+    "matplotlib>=3.10.7",
+    "mlflow>=2.19.0",
+]
+
+[dependency-groups]
+# Full environment for development: training + testing + linting.
+# Install with: uv sync --group dev
+dev = [
+    "churn-lib[train]",
+    "pytest>=8.3.5",
+    "pytest-cov",
+    "pytest-asyncio",
+    "pytest-xdist>=3.6",
+    "ruff",
+    "taskipy>=1.14.0",
+]
+
+[project.scripts]
+trainer = "churn_lib.trainer:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/churn_lib"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["A", "B", "C", "E", "F", "W", "I", "UP", "FURB", "RUF", "PD"]
+exclude = [".venv"]
+ignore = ["E501", "C901"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+ignore-overlong-task-comments = true
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.taskipy.tasks]
+precommit = { cmd = "uvx ruff format . && uvx ruff check . --fix --unsafe-fixes && uvx pyright .", help = "Lint, format and typecheck Python codebase" }
+test = { cmd = "pytest", help = "Run the full test suite in parallel" }
+test-cov = { cmd = "pytest --cov=churn_lib --cov-report=term-missing", help = "Run tests with coverage report" }
+mlflow = { cmd = "docker compose up -d && echo 'MLflow UI: http://localhost:5000'", help = "Start local MLflow tracking server" }
+mlflow-stop = { cmd = "docker compose down", help = "Stop local MLflow tracking server" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-n auto --dist loadscope --tb=short"

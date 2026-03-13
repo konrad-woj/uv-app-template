@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  ml-app:
+    build:
+      context: ..
+      dockerfile: ml-app/Dockerfile
+      # platform: linux/amd64  # prod — catches missing linux/amd64 libs even when built on Mac
+      platform: linux/arm64    # local mac arm
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      # /health is the liveness probe — always 200 while the process is running.
+      # Do NOT use / here: the root endpoint is an informational entry point,
+      # not a health signal. /health will never return 503 due to model state,
+      # so the container won't be falsely restarted while the model is loading.
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
