@@ -38,11 +38,17 @@ class CustomerFeatures(BaseModel):
     age: Annotated[int, Field(ge=18, le=100, description="Customer age in years.")]
     contract_type: Annotated[
         str,
-        Field(description="Contract type: 'month-to-month', 'one_year', or 'two_year'."),
+        Field(
+            description="Contract type: 'month-to-month', 'one-year', or 'two-year'.",
+            examples=["month-to-month"],
+        ),
     ]
     payment_method: Annotated[
         str,
-        Field(description=("Payment method: 'electronic_check', 'mailed_check', 'bank_transfer', or 'credit_card'.")),
+        Field(
+            description="Payment method: 'electronic_check', 'mailed_check', 'bank_transfer', or 'credit_card'.",
+            examples=["electronic_check"],
+        ),
     ]
     has_internet: Annotated[bool, Field(description="Whether the customer has an internet subscription.")]
     has_streaming: Annotated[bool, Field(description="Whether the customer has a streaming add-on.")]
