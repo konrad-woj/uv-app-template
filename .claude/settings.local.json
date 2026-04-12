@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 /Users/konrad/Repo/Konrad/uv-app-template/ml-app/mlflow.db \"UPDATE experiments SET artifact_location = REPLACE\\(artifact_location, '/Users/konradwojciechowski/', '/Users/konrad/'\\); SELECT experiment_id, name, artifact_location FROM experiments;\")",
+      "Bash(sqlite3 /Users/konrad/Repo/Konrad/uv-app-template/ml-app/mlflow.db \"SELECT run_uuid, artifact_uri FROM runs WHERE artifact_uri LIKE '%konradwojciechowski%';\")",
+      "Bash(sqlite3 /Users/konrad/Repo/Konrad/uv-app-template/ml-app/mlflow.db \"UPDATE runs SET artifact_uri = REPLACE\\(artifact_uri, '/Users/konradwojciechowski/', '/Users/konrad/'\\) WHERE artifact_uri LIKE '%konradwojciechowski%'; SELECT changes\\(\\);\")"
+    ]
+  }
+}
