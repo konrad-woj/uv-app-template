@@ -196,23 +196,39 @@ class FeatureDriftOut(BaseModel):
 
 
 class DriftRequest(BaseModel):
-    """Drift detection request — two samples of customer feature data."""
+    """Drift detection request — two samples of customer feature data.
+
+    Both collections use the same CustomerFeatures schema as /predict, so the
+    same validation rules (field ranges, allowed categories) apply. This ensures
+    that only well-formed feature vectors reach the PSI computation — no silent
+    failures from unexpected column names or out-of-range values.
+
+    Typical sources:
+      - reference: a sample saved from the training dataset (or generated via
+        churn-lib's generate_training_data()).
+      - serving:   a rolling window of recent /predict request bodies (last 7
+        or 30 days), collected from your request logs.
+    """
 
     reference: Annotated[
-        list[dict],
+        list[CustomerFeatures],
         Field(
             min_length=1,
             description=(
                 "Reference (training-time) distribution. "
-                "Typically a sample from the dataset used to train the current model."
+                "Typically a sample from the dataset used to train the current model. "
+                "Must contain at least one record; uses the same schema as /predict."
             ),
         ),
     ]
     serving: Annotated[
-        list[dict],
+        list[CustomerFeatures],
         Field(
             min_length=1,
-            description="Recent scoring data to compare against the reference.",
+            description=(
+                "Recent scoring data to compare against the reference. "
+                "Must contain at least one record; uses the same schema as /predict."
+            ),
         ),
     ]
 
