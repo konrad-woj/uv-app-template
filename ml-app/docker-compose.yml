@@ -5,8 +5,8 @@ services:
     build:
       context: ..
       dockerfile: ml-app/Dockerfile
-      # platform: linux/amd64  # prod — catches missing linux/amd64 libs even when built on Mac
-      platform: linux/arm64    # local mac arm
+    # platform: linux/amd64  # prod — catches missing linux/amd64 libs even when built on Mac
+    platform: linux/arm64    # local mac arm
     ports:
       - "8000:8000"
     environment:

@@ -21,7 +21,7 @@ uv sync --group dev
 **Extras at a glance:**
 
 | Extra | Installs | Use when |
-|-------|----------|----------|
+| ----- | -------- | -------- |
 | `predict` | pandas, numpy, scikit-learn, xgboost, pyyaml | Loading a saved pipeline and running inference |
 | `train` | `predict` + matplotlib, mlflow | Training, evaluating, and saving a pipeline |
 | `dev` (group) | `train` + pytest, ruff, taskipy | Local development |
@@ -249,8 +249,8 @@ Every run is also logged to the `churn-prediction` MLflow experiment. Logged per
 The default. Runs are written to `./mlruns` in your working directory.
 
 ```bash
-uv run mlflow ui --port 5000
-# Open http://localhost:5000
+uv run mlflow ui --port 5001
+# Open http://localhost:5001
 ```
 
 **Option 2: Local tracking server (Docker)**
@@ -260,10 +260,10 @@ Starts a persistent MLflow server with a separate artifact store. Results surviv
 ```bash
 # Start the server
 uv run task mlflow
-# MLflow UI: http://localhost:5000
+# MLflow UI: http://localhost:5001
 
 # Point your runs at the server
-export MLFLOW_TRACKING_URI=http://localhost:5000
+export MLFLOW_TRACKING_URI=http://localhost:5001
 uv run trainer
 
 # Stop the server
@@ -272,4 +272,4 @@ uv run task mlflow-stop
 
 Data is persisted in `./mlruns` (metadata) and `./mlartifacts` (artifact files).
 
-**Comparing runs in the UI:** open http://localhost:5000, select the `churn-prediction` experiment, and use the table or chart view to compare metrics across runs. Artifacts (confusion matrix, feature importance, pipeline) are accessible from each run's detail page.
+**Comparing runs in the UI:** open http://localhost:5001, select the `churn-prediction` experiment, and use the table or chart view to compare metrics across runs. Artifacts (confusion matrix, feature importance, pipeline) are accessible from each run's detail page.

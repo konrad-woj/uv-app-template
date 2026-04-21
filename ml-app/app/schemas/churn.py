@@ -71,19 +71,20 @@ class PredictRequest(BaseModel):
         ),
     ]
     threshold: Annotated[
-        float,
+        float | None,
         Field(
-            default=0.5,
+            default=None,
             ge=0.0,
             le=1.0,
             description=(
                 "Decision threshold for the positive (churn) class. "
+                "Defaults to the server-configured `CHURN_DEFAULT_THRESHOLD` when omitted. "
                 "Lower values catch more churners (higher recall, more false positives). "
                 "Higher values are more conservative (higher precision, fewer false alarms). "
                 "Use `optimal_threshold` from a training run for a data-driven operating point."
             ),
         ),
-    ] = 0.5
+    ] = None
 
 
 class PredictionOut(BaseModel):

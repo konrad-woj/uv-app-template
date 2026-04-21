@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main, app]
+  pull_request:
+    branches: [main, app]
+
+jobs:
+  test-churn-lib:
+    name: Test churn-lib
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-caching: true
+      - name: Install dependencies
+        run: uv sync --all-extras
+        working-directory: churn-lib
+      - name: Run tests
+        run: uv run pytest
+        working-directory: churn-lib
+
+  test-ml-app:
+    name: Test ml-app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-caching: true
+      - name: Install dependencies
+        run: uv sync --frozen
+        working-directory: ml-app
+      - name: Run tests
+        run: uv run pytest
+        working-directory: ml-app
+
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-caching: true
+      - name: Install dependencies (churn-lib)
+        run: uv sync --group dev
+        working-directory: churn-lib
+      - name: Check formatting (churn-lib)
+        run: uvx ruff format --check .
+        working-directory: churn-lib
+      - name: Lint (churn-lib)
+        run: uvx ruff check .
+        working-directory: churn-lib
+      - name: Type-check (churn-lib)
+        run: uv run pyright .
+        working-directory: churn-lib
+      - name: Install dependencies (ml-app)
+        run: uv sync
+        working-directory: ml-app
+      - name: Check formatting (ml-app)
+        run: uvx ruff format --check .
+        working-directory: ml-app
+      - name: Lint (ml-app)
+        run: uvx ruff check .
+        working-directory: ml-app
+      - name: Type-check (ml-app)
+        run: uv run pyright .
+        working-directory: ml-app
+
+  lock-files:
+    name: uv.lock up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-caching: true
+      - name: Check churn-lib/uv.lock
+        run: uv lock --check
+        working-directory: churn-lib
+      - name: Check ml-app/uv.lock
+        run: uv lock --check
+        working-directory: ml-app
+
+  openapi:
+    name: OpenAPI spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-caching: true
+      - name: Install dependencies
+        run: uv sync --frozen
+        working-directory: ml-app
+      - name: Generate OpenAPI spec
+        run: |
+          uv run python -c "
+          import json
+          from app.main import app
+          with open('openapi.json', 'w') as f:
+              json.dump(app.openapi(), f, indent=2)
+              f.write('\n')
+          "
+        working-directory: ml-app
+        env:
+          CHURN_LOG_LEVEL: ERROR
+      - name: Check spec is up to date
+        run: |
+          if git ls-files --error-unmatch ml-app/openapi.json 2>/dev/null; then
+            if ! git diff --exit-code ml-app/openapi.json; then
+              echo ""
+              echo "openapi.json is out of date. Regenerate it:"
+              echo "  cd ml-app && uv run python -c \"import json; from app.main import app; open('openapi.json','w').write(json.dumps(app.openapi(), indent=2) + '\n')\""
+              exit 1
+            fi
+          else
+            echo "openapi.json is not committed — skipping drift check. Consider committing ml-app/openapi.json."
+          fi
+      - name: Upload OpenAPI spec
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-spec
+          path: ml-app/openapi.json

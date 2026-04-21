@@ -85,7 +85,9 @@ def fitted_pipeline(config: PipelineConfig, training_df: pd.DataFrame) -> ChurnP
     """Fit a ChurnPipeline once per worker session and share across all tests."""
     pipeline = ChurnPipeline(config)
     X = training_df[config.feature_columns]
+    assert isinstance(X, pd.DataFrame)
     y = training_df[config.target]
+    assert isinstance(y, pd.Series)
     pipeline.fit(X, y)
     return pipeline
 

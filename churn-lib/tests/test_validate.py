@@ -100,7 +100,7 @@ class TestValidateBatch:
 
     def test_non_dict_sample_raises(self, config: PipelineConfig):
         with pytest.raises(ValidationError, match="expected dict"):
-            validate_batch(["not_a_dict"], config)
+            validate_batch(["not_a_dict"], config)  # type: ignore[arg-type]
 
 
 class TestValidateSample:

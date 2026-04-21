@@ -23,7 +23,7 @@ EXPECTED_FEATURE_COLUMNS = [
 class TestGenerateTrainingData:
     def test_churn_column_is_binary(self):
         df = generate_training_data(500, 42)
-        assert df["churn"].isin([0, 1]).all()
+        assert bool(df["churn"].isin([0, 1]).all())
         assert df["churn"].nunique() == 2
 
     def test_feature_columns_present(self):
@@ -33,7 +33,7 @@ class TestGenerateTrainingData:
 
     def test_no_nulls(self):
         df = generate_training_data(200, 1)
-        assert df.isnull().sum().sum() == 0
+        assert df.isna().sum().sum() == 0
 
     def test_reproducibility(self):
         df1 = generate_training_data(200, 99)

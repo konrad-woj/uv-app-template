@@ -111,7 +111,7 @@ def mock_pipeline(config: PipelineConfig) -> MagicMock:
 
 
 @pytest.fixture
-def client(mock_pipeline: MagicMock) -> Generator[TestClient, None, None]:
+def client(mock_pipeline: MagicMock) -> Generator[TestClient]:
     """TestClient with a mock model pre-loaded via two mechanisms:
 
     1. Dependency override: replaces get_pipeline() for all domain endpoints
@@ -140,7 +140,7 @@ def client(mock_pipeline: MagicMock) -> Generator[TestClient, None, None]:
 
 
 @pytest.fixture
-def client_no_model() -> Generator[TestClient, None, None]:
+def client_no_model() -> Generator[TestClient]:
     """TestClient with no model loaded — get_pipeline() will return 503.
 
     No dependency override is set, so get_pipeline() falls through to its

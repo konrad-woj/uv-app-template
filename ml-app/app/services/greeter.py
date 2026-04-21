@@ -11,12 +11,14 @@ Benefits:
     changing the router, not this file.
 """
 
+from app.schemas.greetings import GreetingResponse
 
-def say_hello() -> dict:
+
+def say_hello() -> GreetingResponse:
     """Return a generic greeting from the Greeter service."""
-    return {"message": "Hello! This is a greeting from the Greeter service."}
+    return GreetingResponse(message="Hello! This is a greeting from the Greeter service.")
 
 
-def greet(name: str) -> dict:
+def greet(name: str) -> GreetingResponse:
     """Return a personalised greeting for the given name."""
-    return {"message": f"Welcome, {name}! This is a greeting from the Greeter service."}
+    return GreetingResponse(message=f"Welcome, {name}! This is a greeting from the Greeter service.")

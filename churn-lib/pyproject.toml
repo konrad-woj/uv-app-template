@@ -3,7 +3,7 @@ name = "churn-lib"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = "~=3.12.0"
+requires-python = "~=3.13.0"
 # No mandatory runtime deps — callers install the extras they need.
 dependencies = []
 
@@ -34,6 +34,7 @@ dev = [
     "pytest-cov",
     "pytest-asyncio",
     "pytest-xdist>=3.6",
+    "pyright>=1.1",
     "ruff",
     "taskipy>=1.14.0",
 ]
@@ -53,7 +54,7 @@ packages = ["src/churn_lib"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py313"
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -78,7 +79,7 @@ venv = ".venv"
 precommit = { cmd = "uvx ruff format . && uvx ruff check . --fix --unsafe-fixes && uvx pyright .", help = "Lint, format and typecheck Python codebase" }
 test = { cmd = "pytest", help = "Run the full test suite in parallel" }
 test-cov = { cmd = "pytest --cov=churn_lib --cov-report=term-missing", help = "Run tests with coverage report" }
-mlflow = { cmd = "docker compose up -d && echo 'MLflow UI: http://localhost:5000'", help = "Start local MLflow tracking server" }
+mlflow = { cmd = "docker compose up -d && echo 'MLflow UI: http://localhost:5001'", help = "Start local MLflow tracking server" }
 mlflow-stop = { cmd = "docker compose down", help = "Stop local MLflow tracking server" }
 
 [tool.pytest.ini_options]
