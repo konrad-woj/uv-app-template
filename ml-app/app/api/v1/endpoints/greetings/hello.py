@@ -86,6 +86,6 @@ async def greet_with_data_endpoint(name: str, data: dict) -> GreetAndReturnRespo
     """
     greeting = greet(name)
     return GreetAndReturnResponse(
-        message=greeting["message"] + " Thanks for sending me this data.",
+        message=greeting.message + " Thanks for sending me this data.",
         data=data,
     )

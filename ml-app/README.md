@@ -49,7 +49,7 @@ HTTP Request
 ### Key design principles
 
 | Principle | Where to look |
-|---|---|
+| --- | --- |
 | **Service layer** — no HTTP in business logic | `app/services/` |
 | **Dependency injection** — testable, overridable | `app/core/dependencies.py` |
 | **Optional extras** — inference stays lean | `pyproject.toml`, `api/v1/router.py` |
@@ -144,7 +144,7 @@ All variables use the `CHURN_` prefix. Create a `.env` file in `ml-app/` for loc
 CHURN_MODEL_PATH=./models/20240101_120000/pipeline.joblib
 
 # MLflow tracking server (optional — defaults to ./mlruns if unset)
-CHURN_MLFLOW_TRACKING_URI=http://localhost:5000
+CHURN_MLFLOW_TRACKING_URI=http://localhost:5001
 
 # Decision threshold applied when the request does not specify one (default: 0.5)
 CHURN_DEFAULT_THRESHOLD=0.4

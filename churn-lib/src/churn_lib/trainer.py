@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import matplotlib
+
 matplotlib.use("agg")
 import matplotlib.pyplot as plt
 import mlflow

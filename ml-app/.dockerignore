@@ -19,3 +19,15 @@ htmlcov/
 .git/
 .gitignore
 README.md
+.claude/
+.mlflow/
+mlruns/
+mlartifacts/
+models/
+mlflow.db
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.logs/
+env/
+**/.env

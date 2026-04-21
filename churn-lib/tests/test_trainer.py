@@ -113,7 +113,8 @@ class TestTrainMlflow:
     def test_mlflow_params_logged(self, train_result):
         import mlflow
 
-        row = mlflow.search_runs(experiment_names=["churn-prediction"]).iloc[0]
+        runs_df = mlflow.search_runs(experiment_names=["churn-prediction"])
+        row = runs_df.iloc[0]  # type: ignore[union-attr]
         assert "params.test_size" in row.index
         assert "params.random_seed" in row.index
         assert "params.n_features" in row.index
@@ -121,7 +122,8 @@ class TestTrainMlflow:
     def test_mlflow_metrics_logged(self, train_result):
         import mlflow
 
-        row = mlflow.search_runs(experiment_names=["churn-prediction"]).iloc[0]
+        runs_df = mlflow.search_runs(experiment_names=["churn-prediction"])
+        row = runs_df.iloc[0]  # type: ignore[union-attr]
         assert "metrics.accuracy" in row.index
         assert "metrics.macro_f1" in row.index
 
@@ -178,6 +180,7 @@ class TestFindThreshold:
         """Multi-class pipelines are not supported — returns (0.5, empty DataFrame)."""
         pipeline = ChurnPipeline(config)
         X = training_df[config.feature_columns]
+        assert isinstance(X, pd.DataFrame)
         y = pd.Series([i % 3 for i in range(len(training_df))], name="churn")
         pipeline.fit(X, y)
         threshold, curve_df = find_threshold(pipeline, X, y)

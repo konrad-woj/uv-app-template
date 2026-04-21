@@ -1,0 +1,93 @@
+{
+  "numeric_schemas": [
+    {
+      "name": "tenure_months",
+      "description": "Months since the customer first subscribed.",
+      "min": 0,
+      "max": 120,
+      "categories": null
+    },
+    {
+      "name": "monthly_charges",
+      "description": "Current monthly bill in USD.",
+      "min": 0.0,
+      "max": 500.0,
+      "categories": null
+    },
+    {
+      "name": "num_products",
+      "description": "Number of active products or add-ons.",
+      "min": 1,
+      "max": 10,
+      "categories": null
+    },
+    {
+      "name": "support_calls_last_6m",
+      "description": "Support tickets raised in the past 6 months.",
+      "min": 0,
+      "max": 50,
+      "categories": null
+    },
+    {
+      "name": "age",
+      "description": "Customer age in years.",
+      "min": 18,
+      "max": 100,
+      "categories": null
+    }
+  ],
+  "categorical_schemas": [
+    {
+      "name": "contract_type",
+      "description": "Billing commitment length.",
+      "min": null,
+      "max": null,
+      "categories": [
+        "month-to-month",
+        "one-year",
+        "two-year"
+      ]
+    },
+    {
+      "name": "payment_method",
+      "description": "How the customer pays each month.",
+      "min": null,
+      "max": null,
+      "categories": [
+        "electronic_check",
+        "mailed_check",
+        "bank_transfer",
+        "credit_card"
+      ]
+    }
+  ],
+  "binary_schemas": [
+    {
+      "name": "has_internet",
+      "description": "Customer has an internet service plan.",
+      "min": null,
+      "max": null,
+      "categories": null
+    },
+    {
+      "name": "has_streaming",
+      "description": "Customer has a streaming add-on.",
+      "min": null,
+      "max": null,
+      "categories": null
+    }
+  ],
+  "target": "churn",
+  "model_card": {
+    "name": "Churn Prediction Model",
+    "version": "1.0.0",
+    "description": "Binary classifier that estimates the probability a customer will cancel their subscription within the next billing cycle.",
+    "intended_use": "Identify at-risk customers so the retention team can send targeted offers. Use find_threshold() to pick the operating point that matches your business constraint (e.g. recall >= 0.8 before maximising precision).",
+    "limitations": "Trained on synthetic data. Validate against real customer cohorts before production use and retrain whenever drift is detected on any feature."
+  },
+  "n_estimators": 100,
+  "max_depth": 6,
+  "learning_rate": 0.1,
+  "random_state": 42,
+  "use_class_weights": true
+}

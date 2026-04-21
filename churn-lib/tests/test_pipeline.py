@@ -68,6 +68,7 @@ class TestPipelineConfig:
 
 class TestChurnPipelineFit:
     def test_classes_and_labels_set_after_fit(self, fitted_pipeline: ChurnPipeline):
+        assert fitted_pipeline.classes_ is not None
         assert set(fitted_pipeline.classes_) == {0, 1}
         assert fitted_pipeline.label_names_ == ["0", "1"]
 
