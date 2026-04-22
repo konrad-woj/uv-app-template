@@ -25,15 +25,15 @@ CLI:
 
 from __future__ import annotations
 
-import logging
 from typing import TypedDict, cast
 
 import numpy as np
 import pandas as pd
+from logger import get_logger
 
 from churn_lib.pipeline import PipelineConfig
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _PSI_STABLE = 0.10
 _PSI_MODERATE = 0.25
@@ -83,18 +83,18 @@ def check_drift(
 
     for feature in config.numeric_features:
         if feature not in reference_df.columns or feature not in serving_df.columns:
-            logger.warning("Feature missing from one dataset — skipping", extra={"feature": feature})
+            logger.warning("Feature missing from one dataset — skipping", feature=feature)
             continue
         ref_col = cast(pd.Series, reference_df[feature]).dropna()
         serv_col = cast(pd.Series, serving_df[feature]).dropna()
         psi = _psi_numeric(ref_col, serv_col)
         status = _psi_status(psi)
         results.append(FeatureDriftResult(feature=feature, feature_type="numeric", psi=round(psi, 4), status=status))
-        logger.debug("Numeric drift", extra={"feature": feature, "psi": round(psi, 4), "status": status})
+        logger.debug("Numeric drift", feature=feature, psi=round(psi, 4), status=status)
 
     for feature in config.categorical_features:
         if feature not in reference_df.columns or feature not in serving_df.columns:
-            logger.warning("Feature missing from one dataset — skipping", extra={"feature": feature})
+            logger.warning("Feature missing from one dataset — skipping", feature=feature)
             continue
         ref_col = cast(pd.Series, reference_df[feature]).dropna()
         serv_col = cast(pd.Series, serving_df[feature]).dropna()
@@ -103,11 +103,11 @@ def check_drift(
         results.append(
             FeatureDriftResult(feature=feature, feature_type="categorical", psi=round(psi, 4), status=status)
         )
-        logger.debug("Categorical drift", extra={"feature": feature, "psi": round(psi, 4), "status": status})
+        logger.debug("Categorical drift", feature=feature, psi=round(psi, 4), status=status)
 
     for feature in config.binary_features:
         if feature not in reference_df.columns or feature not in serving_df.columns:
-            logger.warning("Feature missing from one dataset — skipping", extra={"feature": feature})
+            logger.warning("Feature missing from one dataset — skipping", feature=feature)
             continue
         # Treat booleans as categorical with two categories
         ref_col = cast(pd.Series, reference_df[feature]).astype(str).dropna()
@@ -115,7 +115,7 @@ def check_drift(
         psi = _psi_categorical(ref_col, serv_col)
         status = _psi_status(psi)
         results.append(FeatureDriftResult(feature=feature, feature_type="binary", psi=round(psi, 4), status=status))
-        logger.debug("Binary drift", extra={"feature": feature, "psi": round(psi, 4), "status": status})
+        logger.debug("Binary drift", feature=feature, psi=round(psi, 4), status=status)
 
     drifted = [r["feature"] for r in results if r["status"] != "stable"]
     statuses = [r["status"] for r in results]
@@ -131,14 +131,12 @@ def check_drift(
 
     logger.info(
         "Drift check complete",
-        extra={
-            "reference_samples": len(reference_df),
-            "serving_samples": len(serving_df),
-            "n_features_checked": len(results),
-            "n_drifted": len(drifted),
-            "overall_status": overall,
-            "drifted_features": drifted,
-        },
+        reference_samples=len(reference_df),
+        serving_samples=len(serving_df),
+        n_features_checked=len(results),
+        n_drifted=len(drifted),
+        overall_status=overall,
+        drifted_features=drifted,
     )
 
     if output_path:
@@ -146,7 +144,7 @@ def check_drift(
         from pathlib import Path
 
         Path(output_path).write_text(json.dumps(report, indent=2, default=str))
-        logger.info("Drift report saved", extra={"path": output_path})
+        logger.info("Drift report saved", path=output_path)
 
     return report
 
@@ -202,8 +200,9 @@ def main() -> None:
     """Compare two CSV/JSON datasets for feature drift from the command line."""
     import argparse
     import json
+    import os
 
-    from churn_lib._logging import configure_cli_logging
+    from logger import configure_logging
 
     parser = argparse.ArgumentParser(
         prog="python -m churn_lib.drift",
@@ -221,7 +220,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    configure_cli_logging(args.log_level)
+    os.environ["LOG_LEVEL"] = args.log_level
+    configure_logging()
 
     cfg = PipelineConfig.from_yaml(args.config) if args.config else PipelineConfig.from_yaml()
     reference_df = pd.read_csv(args.reference)

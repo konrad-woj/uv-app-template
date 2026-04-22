@@ -4,7 +4,9 @@ WORKDIR /app
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    LOG_ENV=production \
+    LOG_LEVEL=INFO
 
 # ---------------------------------------------------------------------------
 # Non-root user — security best practice for containerised services.

@@ -7,7 +7,6 @@ a plain dataclass so it can be diffed, versioned, and logged without ceremony.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,13 +15,14 @@ import joblib
 import numpy as np
 import pandas as pd
 import yaml
+from logger import get_logger
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from xgboost import XGBClassifier
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parent / "default_config.yaml"
 
@@ -225,14 +225,12 @@ class ChurnPipeline:
         cfg = self.config
         logger.debug(
             "Building pipeline",
-            extra={
-                "n_numeric": len(cfg.numeric_features),
-                "n_categorical": len(cfg.categorical_features),
-                "n_binary": len(cfg.binary_features),
-                "n_estimators": cfg.n_estimators,
-                "max_depth": cfg.max_depth,
-                "learning_rate": cfg.learning_rate,
-            },
+            n_numeric=len(cfg.numeric_features),
+            n_categorical=len(cfg.categorical_features),
+            n_binary=len(cfg.binary_features),
+            n_estimators=cfg.n_estimators,
+            max_depth=cfg.max_depth,
+            learning_rate=cfg.learning_rate,
         )
 
         numeric_transformer = Pipeline(
@@ -290,14 +288,12 @@ class ChurnPipeline:
         class_counts = {str(cls): int((y == cls).sum()) for cls in self.classes_}
         logger.info(
             "Fitting pipeline",
-            extra={
-                "n_samples": len(y),
-                "n_features": len(self.config.feature_columns),
-                "n_classes": len(self.classes_),
-                "classes": self.label_names_,
-                "class_counts": class_counts,
-                "weighted": sample_weight is not None,
-            },
+            n_samples=len(y),
+            n_features=len(self.config.feature_columns),
+            n_classes=len(self.classes_),
+            classes=self.label_names_,
+            class_counts=class_counts,
+            weighted=sample_weight is not None,
         )
 
         fit_params: dict[str, Any] = {}
@@ -307,7 +303,8 @@ class ChurnPipeline:
         self._pipeline.fit(X[self.config.feature_columns], y, **fit_params)
         logger.info(
             "Pipeline fit complete",
-            extra={"n_samples": len(y), "classes": self.label_names_},
+            n_samples=len(y),
+            classes=self.label_names_,
         )
         return self
 
@@ -331,7 +328,9 @@ class ChurnPipeline:
         size_kb = round(path.stat().st_size / 1024, 1)
         logger.info(
             "Pipeline saved",
-            extra={"path": str(path), "size_kb": size_kb, "classes": self.label_names_},
+            path=str(path),
+            size_kb=size_kb,
+            classes=self.label_names_,
         )
 
     @classmethod
@@ -341,10 +340,8 @@ class ChurnPipeline:
         pipeline: ChurnPipeline = joblib.load(path)
         logger.info(
             "Pipeline loaded",
-            extra={
-                "path": str(path),
-                "classes": pipeline.label_names_,
-                "n_features": len(pipeline.config.feature_columns),
-            },
+            path=str(path),
+            classes=pipeline.label_names_,
+            n_features=len(pipeline.config.feature_columns),
         )
         return pipeline

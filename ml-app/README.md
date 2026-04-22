@@ -150,7 +150,9 @@ CHURN_MLFLOW_TRACKING_URI=http://localhost:5001
 CHURN_DEFAULT_THRESHOLD=0.4
 
 # Logging verbosity: DEBUG | INFO | WARNING | ERROR (default: INFO)
-CHURN_LOG_LEVEL=INFO
+LOG_LEVEL=INFO
+# Output format: "production" for JSON, unset for coloured console
+LOG_ENV=production
 ```
 
 ---

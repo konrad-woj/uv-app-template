@@ -7,12 +7,11 @@ support-call frequency, and payment method.
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
 import pandas as pd
+from logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _CONTRACT_TYPES = ["month-to-month", "one-year", "two-year"]
 _PAYMENT_METHODS = ["credit_card", "bank_transfer", "electronic_check", "mailed_check"]
@@ -88,14 +87,12 @@ def generate_training_data(n_samples: int = 5_000, random_seed: int = 42) -> pd.
     churn_rate = float(df["churn"].mean())
     logger.info(
         "Training data generated",
-        extra={
-            "n_samples": n_samples,
-            "random_seed": random_seed,
-            "churn_rate": round(churn_rate, 4),
-            "n_churned": int(df["churn"].sum()),
-            "n_retained": int((df["churn"] == 0).sum()),
-            "features": list(df.columns[:-1]),
-        },
+        n_samples=n_samples,
+        random_seed=random_seed,
+        churn_rate=round(churn_rate, 4),
+        n_churned=int(df["churn"].sum()),
+        n_retained=int((df["churn"] == 0).sum()),
+        features=list(df.columns[:-1]),
     )
     return df
 
@@ -113,10 +110,8 @@ def generate_prediction_data(n_samples: int = 100, random_seed: int = 123) -> pd
     df = _base_features(rng, n_samples)
     logger.info(
         "Prediction data generated",
-        extra={
-            "n_samples": n_samples,
-            "random_seed": random_seed,
-            "features": list(df.columns),
-        },
+        n_samples=n_samples,
+        random_seed=random_seed,
+        features=list(df.columns),
     )
     return df

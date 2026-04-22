@@ -17,7 +17,6 @@ The inference-only process never touches these imports.
 from __future__ import annotations
 
 import json
-import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -25,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from churn_lib import ChurnPipeline, PipelineConfig
 from churn_lib.data_generator import generate_training_data
 from churn_lib.trainer import train
+from logger import get_logger
 
 from app.core.config import settings
 from app.schemas.churn import TrainResponse
@@ -32,7 +32,7 @@ from app.schemas.churn import TrainResponse
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def run_training(
@@ -68,11 +68,13 @@ def run_training(
     # any coupling between this service and the mlflow import in the trainer.
     if settings.mlflow_tracking_uri:
         os.environ.setdefault("MLFLOW_TRACKING_URI", settings.mlflow_tracking_uri)
-        logger.info("MLflow tracking URI set", extra={"uri": settings.mlflow_tracking_uri})
+        logger.info("MLflow tracking URI set", uri=settings.mlflow_tracking_uri)
 
     logger.info(
         "Training run started",
-        extra={"n_samples": n_samples, "output_dir": output_dir, "test_size": test_size},
+        n_samples=n_samples,
+        output_dir=output_dir,
+        test_size=test_size,
     )
 
     cfg = PipelineConfig.from_yaml()
@@ -123,7 +125,7 @@ def run_training(
     # No restart required — FastAPI stores it on app.state which is shared
     # across all requests in this process.
     app.state.pipeline = pipeline
-    logger.info("Model hot-reloaded into app.state", extra={"model_path": str(model_path)})
+    logger.info("Model hot-reloaded into app.state", model_path=str(model_path))
 
     return TrainResponse(
         status="ok",

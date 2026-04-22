@@ -17,12 +17,11 @@ Why a global handler instead of try/except in every endpoint?
   propagate naturally and be caught here once, keeping endpoint code clean.
 """
 
-import logging
-
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -41,7 +40,8 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     """
     logger.exception(
         "Unhandled exception",
-        extra={"method": request.method, "path": str(request.url.path)},
+        method=request.method,
+        path=str(request.url.path),
     )
     return JSONResponse(
         status_code=500,

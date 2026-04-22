@@ -21,17 +21,17 @@ Example
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import TypedDict
 
 import numpy as np
 import pandas as pd
+from logger import get_logger
 
 from churn_lib.pipeline import ChurnPipeline
 from churn_lib.validate import validate_batch
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class PredictionResult(TypedDict):
@@ -61,7 +61,7 @@ def predict_single(
         sample:    Feature values as a flat dict.
         threshold: Decision threshold for binary models. Ignored for multi-class.
     """
-    logger.debug("predict_single called", extra={"features": list(sample.keys()), "threshold": threshold})
+    logger.debug("predict_single called", features=list(sample.keys()), threshold=threshold)
     return predict_batch(pipeline, [sample], threshold=threshold)[0]
 
 
@@ -100,7 +100,9 @@ def predict_batch(
 
     logger.debug(
         "predict_batch started",
-        extra={"batch_size": len(samples), "n_classes": len(classes), "threshold": threshold},
+        batch_size=len(samples),
+        n_classes=len(classes),
+        threshold=threshold,
     )
 
     t0 = time.perf_counter()
@@ -119,7 +121,8 @@ def predict_batch(
         if threshold != 0.5:
             logger.debug(
                 "Custom threshold applied",
-                extra={"threshold": threshold, "binary": True},
+                threshold=threshold,
+                binary=True,
             )
     else:
         predictions = pipeline.predict(df)
@@ -136,14 +139,12 @@ def predict_batch(
     class_counts = {class_to_label[cls]: int((predictions == cls).sum()) for cls in classes}
     logger.info(
         "predict_batch complete",
-        extra={
-            "batch_size": len(samples),
-            "n_classes": len(classes),
-            "threshold": threshold,
-            "elapsed_ms": round(elapsed_ms, 2),
-            "throughput_per_sec": (round(len(samples) / (elapsed_ms / 1000), 1) if elapsed_ms > 0 else None),
-            "class_distribution": class_counts,
-        },
+        batch_size=len(samples),
+        n_classes=len(classes),
+        threshold=threshold,
+        elapsed_ms=round(elapsed_ms, 2),
+        throughput_per_sec=(round(len(samples) / (elapsed_ms / 1000), 1) if elapsed_ms > 0 else None),
+        class_distribution=class_counts,
     )
     return results
 
@@ -158,9 +159,11 @@ def main() -> None:
     """Score customer records from the command line using a fitted pipeline."""
     import argparse
     import json
+    import os
     from pathlib import Path
 
-    from churn_lib._logging import configure_cli_logging
+    from logger import configure_logging
+
     from churn_lib.data_generator import generate_prediction_data
 
     parser = argparse.ArgumentParser(
@@ -207,7 +210,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    configure_cli_logging(args.log_level)
+    os.environ["LOG_LEVEL"] = args.log_level
+    configure_logging()
 
     pipeline = ChurnPipeline.load(args.model)
 
@@ -215,13 +219,14 @@ def main() -> None:
         path = Path(args.input)
         df = pd.read_csv(path) if path.suffix == ".csv" else pd.read_json(path)
         samples = df.to_dict(orient="records")
-        logger.info("Input loaded", extra={"source": str(path), "n_samples": len(samples)})
+        logger.info("Input loaded", source=str(path), n_samples=len(samples))
     else:
         df = generate_prediction_data(n_samples=args.n_samples, random_seed=args.seed)
         samples = df.to_dict(orient="records")
         logger.info(
             "Synthetic input generated",
-            extra={"n_samples": len(samples), "seed": args.seed},
+            n_samples=len(samples),
+            seed=args.seed,
         )
 
     results = predict_batch(pipeline, samples)
