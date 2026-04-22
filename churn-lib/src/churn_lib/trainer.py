@@ -10,7 +10,6 @@ CLI usage:
 from __future__ import annotations
 
 import json
-import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -22,6 +21,7 @@ import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
+from logger import get_logger
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     classification_report,
@@ -34,7 +34,7 @@ from churn_lib.pipeline import ChurnPipeline, PipelineConfig
 
 MLFLOW_EXPERIMENT = "churn-prediction"
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def train(
@@ -62,11 +62,9 @@ def train(
 
     logger.info(
         "Training run started",
-        extra={
-            "model": cfg.model_card.name,
-            "version": cfg.model_card.version,
-            "run_dir": str(run_dir),
-        },
+        model=cfg.model_card.name,
+        version=cfg.model_card.version,
+        run_dir=str(run_dir),
     )
 
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
@@ -87,12 +85,10 @@ def train(
         class_distribution = {str(cls): int((y == cls).sum()) for cls in np.unique(y)}
         logger.info(
             "Dataset loaded",
-            extra={
-                "total_samples": len(df),
-                "n_features": len(cfg.feature_columns),
-                "target": cfg.target,
-                "class_distribution": class_distribution,
-            },
+            total_samples=len(df),
+            n_features=len(cfg.feature_columns),
+            target=cfg.target,
+            class_distribution=class_distribution,
         )
 
         # train_test_split stubs return list[Any]; cast each split to its concrete type.
@@ -103,13 +99,11 @@ def train(
         y_test = cast(pd.Series, splits[3])
         logger.info(
             "Train/test split complete",
-            extra={
-                "n_train": len(y_train),
-                "n_test": len(y_test),
-                "test_size": test_size,
-                "stratified": True,
-                "random_seed": random_seed,
-            },
+            n_train=len(y_train),
+            n_test=len(y_test),
+            test_size=test_size,
+            stratified=True,
+            random_seed=random_seed,
         )
 
         # Step 2: class imbalance — weights applied to train set only so the test
@@ -120,11 +114,9 @@ def train(
             sample_weight = weights
             logger.info(
                 "Sample weights computed",
-                extra={
-                    "strategy": "balanced",
-                    "min_weight": round(float(weights.min()), 4),
-                    "max_weight": round(float(weights.max()), 4),
-                },
+                strategy="balanced",
+                min_weight=round(float(weights.min()), 4),
+                max_weight=round(float(weights.max()), 4),
             )
 
         # Step 3: fit
@@ -152,7 +144,7 @@ def train(
                 m: dict[str, float] = report_dict[label]
                 logger.info(
                     "Class metrics",
-                    extra={
+                    **{
                         "class": label,
                         "precision": round(m["precision"], 4),
                         "recall": round(m["recall"], 4),
@@ -165,11 +157,9 @@ def train(
                 metrics[f"{label}_f1"] = round(m["f1-score"], 4)
         logger.info(
             "Overall metrics",
-            extra={
-                "accuracy": metrics["accuracy"],
-                "macro_f1": metrics["macro_f1"],
-                "weighted_f1": metrics["weighted_f1"],
-            },
+            accuracy=metrics["accuracy"],
+            macro_f1=metrics["macro_f1"],
+            weighted_f1=metrics["weighted_f1"],
         )
 
         # Step 5: threshold calibration (binary only)
@@ -179,7 +169,8 @@ def train(
             _save_json(threshold_curve.to_dict(orient="records"), run_dir / "threshold_curve.json")  # type: ignore[arg-type]
             logger.info(
                 "Threshold calibration complete",
-                extra={"optimal_threshold": optimal_threshold, "objective": "f1"},
+                optimal_threshold=optimal_threshold,
+                objective="f1",
             )
         metrics["optimal_threshold"] = optimal_threshold
         mlflow.log_metrics(metrics)
@@ -193,7 +184,7 @@ def train(
         pipeline.save(run_dir / "pipeline.joblib")
         mlflow.log_artifacts(str(run_dir))
 
-        logger.info("All artifacts saved", extra={"run_dir": str(run_dir)})
+        logger.info("All artifacts saved", run_dir=str(run_dir))
 
     return (
         f"Run saved to: {run_dir}\n"
@@ -309,13 +300,11 @@ def find_threshold(
 
     logger.info(
         "Threshold sweep complete",
-        extra={
-            "objective": objective,
-            "optimal_threshold": best_threshold,
-            "precision_at_optimal": float(cast(float, curve_df.loc[best_idx, "precision"])),
-            "recall_at_optimal": float(cast(float, curve_df.loc[best_idx, "recall"])),
-            "f1_at_optimal": float(cast(float, curve_df.loc[best_idx, "f1"])),
-        },
+        objective=objective,
+        optimal_threshold=best_threshold,
+        precision_at_optimal=float(cast(float, curve_df.loc[best_idx, "precision"])),
+        recall_at_optimal=float(cast(float, curve_df.loc[best_idx, "recall"])),
+        f1_at_optimal=float(cast(float, curve_df.loc[best_idx, "f1"])),
     )
     return best_threshold, curve_df
 
@@ -389,8 +378,10 @@ def _save_feature_importance(pipeline: ChurnPipeline, path: Path) -> None:
 def main() -> None:
     """Train with defaults or CLI overrides; argparse is imported here only."""
     import argparse
+    import os
 
-    from churn_lib._logging import configure_cli_logging
+    from logger import configure_logging
+
     from churn_lib.data_generator import generate_training_data
 
     parser = argparse.ArgumentParser(
@@ -438,7 +429,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    configure_cli_logging(args.log_level)
+    os.environ["LOG_LEVEL"] = args.log_level
+    configure_logging()
 
     cfg = PipelineConfig.from_yaml(args.config) if args.config else PipelineConfig.from_yaml()
     df = generate_training_data(n_samples=args.n_samples, random_seed=args.seed)

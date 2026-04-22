@@ -124,7 +124,7 @@ jobs:
           "
         working-directory: ml-app
         env:
-          CHURN_LOG_LEVEL: ERROR
+          LOG_LEVEL: ERROR
       - name: Check spec is up to date
         run: |
           if git ls-files --error-unmatch ml-app/openapi.json 2>/dev/null; then

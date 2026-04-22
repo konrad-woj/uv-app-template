@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "~=3.13.0"
 # No mandatory runtime deps — callers install the extras they need.
-dependencies = []
+dependencies = ["logger"]
 
 [project.optional-dependencies]
 # Minimal set for loading a saved pipeline and running inference.
@@ -41,6 +41,9 @@ dev = [
 
 [project.scripts]
 trainer = "churn_lib.trainer:main"
+
+[tool.uv.sources]
+logger = { git = "https://github.com/konrad-woj/logger.git" }
 
 [build-system]
 requires = ["hatchling"]

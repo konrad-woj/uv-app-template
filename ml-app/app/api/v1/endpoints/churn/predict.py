@@ -15,10 +15,9 @@ Design notes:
     raises a 503 before the handler is called.
 """
 
-import logging
-
 from churn_lib import ChurnPipeline, ValidationError
 from fastapi import APIRouter, Depends, HTTPException, status
+from logger import get_logger
 
 from app.core.config import Settings
 from app.core.dependencies import get_pipeline, get_settings
@@ -32,7 +31,7 @@ from app.schemas.churn import (
 )
 from app.services.churn.inference import run_prediction
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 router = APIRouter()
 
 
@@ -87,7 +86,7 @@ async def predict(
     try:
         predictions = run_prediction(pipeline, body.customers, threshold)
     except ValidationError as exc:
-        logger.warning("Prediction validation failed", extra={"error": str(exc), "batch_size": len(body.customers)})
+        logger.warning("Prediction validation failed", error=str(exc), batch_size=len(body.customers))
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),

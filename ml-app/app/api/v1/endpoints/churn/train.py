@@ -27,16 +27,16 @@ In-memory job store:
 """
 
 import asyncio
-import logging
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from logger import get_logger
 
 from app.schemas.churn import JobStatusResponse, TrainJobResponse, TrainRequest, TrainResponse
 from app.services.churn.training import run_training
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
@@ -208,7 +208,7 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
 async def _run_training_job(job_id: str, app: Any, body: TrainRequest) -> None:
     """Background task: run training in a thread and update the job store."""
     _jobs[job_id]["status"] = "running"
-    logger.info("Background training job started", extra={"job_id": job_id})
+    logger.info("Background training job started", job_id=job_id)
     try:
         result = await asyncio.to_thread(
             run_training,
@@ -220,8 +220,8 @@ async def _run_training_job(job_id: str, app: Any, body: TrainRequest) -> None:
         )
         _jobs[job_id]["status"] = "done"
         _jobs[job_id]["result"] = result
-        logger.info("Background training job completed", extra={"job_id": job_id})
+        logger.info("Background training job completed", job_id=job_id)
     except Exception as exc:
         _jobs[job_id]["status"] = "failed"
         _jobs[job_id]["error"] = str(exc)
-        logger.exception("Background training job failed", extra={"job_id": job_id})
+        logger.exception("Background training job failed", job_id=job_id)

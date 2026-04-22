@@ -10,6 +10,7 @@ dependencies = [
     # process lean and safe for production inference workloads.
     "churn-lib[predict]",
     "fastapi>=0.115.0",
+    "logger",
     "pydantic-settings>=2.0",
     "uvicorn[standard]>=0.32.0",
 ]
@@ -49,6 +50,7 @@ dev = [
 
 [tool.uv.sources]
 churn-lib = { path = "../churn-lib", editable = true }
+logger = { git = "https://github.com/konrad-woj/logger.git" }
 
 [project.scripts]
 # Expose the churn-lib trainer CLI when this package is installed.

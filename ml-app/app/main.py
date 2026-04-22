@@ -41,7 +41,8 @@ Environment variables (see app/core/config.py for the full list):
     CHURN_MODEL_PATH          Path to a trained pipeline.joblib to load at startup.
     CHURN_MLFLOW_TRACKING_URI MLflow server URI for experiment tracking.
     CHURN_DEFAULT_THRESHOLD   Default prediction threshold (default: 0.5).
-    CHURN_LOG_LEVEL           Logging verbosity — DEBUG, INFO, WARNING, ERROR (default: INFO).
+    LOG_LEVEL                 Logging verbosity — DEBUG, INFO, WARNING, ERROR (default: INFO).
+    LOG_ENV                   Set to "production" for JSON output; unset for coloured console.
 
 Quick start:
     uv run uvicorn app.main:app --reload
@@ -49,13 +50,13 @@ Quick start:
 """
 
 import asyncio
-import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Request, status
+from logger import configure_logging, get_logger
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
@@ -63,7 +64,7 @@ from app.api.v1.router import router as v1_router
 from app.core.config import settings
 from app.core.errors import unhandled_exception_handler
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +93,7 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
         @router.post("/predict")
         async def predict(request: Request, ...):
-            logger.info("Scoring batch", extra={"request_id": request.state.request_id})
+            logger.info("Scoring batch", request_id=request.state.request_id)
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -114,14 +115,10 @@ async def lifespan(app: FastAPI):
     """
     # ── Startup ──────────────────────────────────────────────────────────────
 
-    # Configure structured JSON logging using the same formatter as churn-lib
-    # so all log output — from this app and from the library — is consistent.
-    # Do this first so all subsequent startup log lines are already structured.
-    from churn_lib._logging import configure_cli_logging
+    # Configure structured logging. Reads LOG_LEVEL and LOG_ENV from the environment.
+    configure_logging()
 
-    configure_cli_logging(level=settings.log_level)
-
-    logger.info("Churn App starting", extra={"log_level": settings.log_level, "version": "0.1.0"})
+    logger.info("Churn App starting", version="0.1.0")
 
     app.state.pipeline = None
 
@@ -132,7 +129,7 @@ async def lifespan(app: FastAPI):
             # accept training requests when churn-lib[train] is installed.
             logger.warning(
                 "CHURN_MODEL_PATH is set but the file does not exist — starting without a model.",
-                extra={"model_path": str(settings.model_path)},
+                model_path=str(settings.model_path),
             )
         else:
             # ChurnPipeline.load() uses joblib (blocking I/O).
@@ -146,17 +143,15 @@ async def lifespan(app: FastAPI):
                 elapsed = round((time.perf_counter() - t0) * 1000)
                 logger.info(
                     "Model loaded at startup",
-                    extra={
-                        "model_path": str(settings.model_path),
-                        "elapsed_ms": elapsed,
-                        "model_version": app.state.pipeline.config.model_card.version,
-                    },
+                    model_path=str(settings.model_path),
+                    elapsed_ms=elapsed,
+                    model_version=app.state.pipeline.config.model_card.version,
                 )
             except Exception:
                 # Corrupt or incompatible file — log and proceed without a model.
                 logger.exception(
                     "Failed to load model at startup — starting without a model.",
-                    extra={"model_path": str(settings.model_path)},
+                    model_path=str(settings.model_path),
                 )
     else:
         logger.info(

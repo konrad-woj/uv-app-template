@@ -8,7 +8,8 @@ Example .env:
     CHURN_MODEL_PATH=./models/20240101_120000/pipeline.joblib
     CHURN_MLFLOW_TRACKING_URI=http://localhost:5000
     CHURN_DEFAULT_THRESHOLD=0.4
-    CHURN_LOG_LEVEL=DEBUG
+    LOG_LEVEL=DEBUG
+    LOG_ENV=production
 """
 
 from pathlib import Path
@@ -39,14 +40,6 @@ class Settings(BaseSettings):
             "MLflow tracking server URI (e.g. http://localhost:5000). "
             "If unset, MLflow logs to the local ./mlruns directory. "
             "Only relevant when the [train] extra is installed."
-        ),
-    )
-    log_level: str = Field(
-        default="INFO",
-        description=(
-            "Logging verbosity for the application. "
-            "Accepts standard Python level names: DEBUG, INFO, WARNING, ERROR. "
-            "Logs are emitted as structured JSON using churn-lib's JsonFormatter."
         ),
     )
     default_threshold: float = Field(
