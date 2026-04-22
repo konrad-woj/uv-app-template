@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main, app]
+    branches: [main]
   pull_request:
-    branches: [main, app]
 
 jobs:
   test-churn-lib:
@@ -37,51 +36,69 @@ jobs:
         run: uv run pytest
         working-directory: ml-app
 
-  lint:
-    name: Lint & type-check
+  lint-churn-lib:
+    name: Lint & type-check churn-lib
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           enable-caching: true
-      - name: Install dependencies (churn-lib)
+      - name: Install dependencies
         run: uv sync --group dev
         working-directory: churn-lib
-      - name: Check formatting (churn-lib)
+      - name: Check formatting
         run: uvx ruff format --check .
         working-directory: churn-lib
-      - name: Lint (churn-lib)
+      - name: Lint
         run: uvx ruff check .
         working-directory: churn-lib
-      - name: Type-check (churn-lib)
+      - name: Type-check
         run: uv run pyright .
         working-directory: churn-lib
-      - name: Install dependencies (ml-app)
+
+  lint-ml-app:
+    name: Lint & type-check ml-app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-caching: true
+      - name: Install dependencies
         run: uv sync
         working-directory: ml-app
-      - name: Check formatting (ml-app)
+      - name: Check formatting
         run: uvx ruff format --check .
         working-directory: ml-app
-      - name: Lint (ml-app)
+      - name: Lint
         run: uvx ruff check .
         working-directory: ml-app
-      - name: Type-check (ml-app)
+      - name: Type-check
         run: uv run pyright .
         working-directory: ml-app
 
-  lock-files:
-    name: uv.lock up to date
+  lock-churn-lib:
+    name: uv.lock up to date (churn-lib)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           enable-caching: true
-      - name: Check churn-lib/uv.lock
+      - name: Check uv.lock
         run: uv lock --check
         working-directory: churn-lib
-      - name: Check ml-app/uv.lock
+
+  lock-ml-app:
+    name: uv.lock up to date (ml-app)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-caching: true
+      - name: Check uv.lock
         run: uv lock --check
         working-directory: ml-app
 
