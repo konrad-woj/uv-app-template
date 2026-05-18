@@ -82,6 +82,54 @@ jobs:
         run: uv run pyright .
         working-directory: ml-app
 
+  test-agent-lib:
+    name: Test agent-lib
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+        working-directory: agent-lib
+      - name: Run tests
+        run: uv run pytest
+        working-directory: agent-lib
+
+  lint-agent-lib:
+    name: Lint & type-check agent-lib
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --frozen --group dev
+        working-directory: agent-lib
+      - name: Check formatting
+        run: uv run ruff format --check .
+        working-directory: agent-lib
+      - name: Lint
+        run: uv run ruff check .
+        working-directory: agent-lib
+      - name: Type-check
+        run: uv run pyright .
+        working-directory: agent-lib
+
+  lock-agent-lib:
+    name: uv.lock up to date (agent-lib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Check uv.lock
+        run: uv lock --check
+        working-directory: agent-lib
+
   lock-churn-lib:
     name: uv.lock up to date (churn-lib)
     runs-on: ubuntu-latest
