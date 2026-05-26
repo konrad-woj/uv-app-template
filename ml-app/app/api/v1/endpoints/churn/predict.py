@@ -85,12 +85,12 @@ async def predict(
     threshold = body.threshold if body.threshold is not None else settings.default_threshold
     try:
         predictions = run_prediction(pipeline, body.customers, threshold)
-    except ValidationError as exc:
-        logger.warning("Prediction validation failed", error=str(exc), batch_size=len(body.customers))
+    except ValidationError as err:
+        logger.warning("Prediction validation failed", error=str(err), batch_size=len(body.customers))
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=str(exc),
-        ) from exc
+            detail=str(err),
+        ) from err
 
     return PredictResponse(
         predictions=predictions,

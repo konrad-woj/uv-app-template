@@ -96,12 +96,12 @@ async def train_sync(body: TrainRequest, request: Request) -> TrainResponse:
             body.test_size,
             body.random_seed,
         )
-    except Exception as exc:
+    except Exception as err:
         logger.exception("Synchronous training run failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Training failed: {exc}",
-        ) from exc
+            detail=f"Training failed: {err}",
+        ) from err
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +221,7 @@ async def _run_training_job(job_id: str, app: Any, body: TrainRequest) -> None:
         _jobs[job_id]["status"] = "done"
         _jobs[job_id]["result"] = result
         logger.info("Background training job completed", job_id=job_id)
-    except Exception as exc:
+    except Exception as err:
         _jobs[job_id]["status"] = "failed"
-        _jobs[job_id]["error"] = str(exc)
+        _jobs[job_id]["error"] = str(err)
         logger.exception("Background training job failed", job_id=job_id)
