@@ -4,7 +4,7 @@
 
 `agent-lib` already has a skeleton with Postgres checkpointing and time-travel tests. The goal is to create `agent-app/` as a best-practice, educational FastAPI service that sits alongside `churn-app/` and shows the full LangGraph feature set: time-travel, interrupts, async nodes, subgraphs, and SSE token streaming. LiteLLM + Ollama is the default LLM backend. The project informs structural patterns only (node factories, interrupt/resume flow, eval framework shape) — all business logic is original.
 
-**Quality bar**: Production-grade code (type hints everywhere, async-first, structured logging, proper error hierarchy, Pydantic validation at boundaries) with deliberately simple business logic — the research assistant domain is a vehicle to demonstrate LangGraph features cleanly.
+**Quality bar**: Production-grade code (type hints everywhere, async-first, structured logging via the custom `logger` package (`get_logger(__name__)` + `configure_logging()` called once in lifespan — never stdlib `logging`), proper error hierarchy, Pydantic validation at boundaries) with deliberately simple business logic — the research assistant domain is a vehicle to demonstrate LangGraph features cleanly.
 
 **The agent**: A **research assistant** that validates input, plans a research task, pauses for human approval, fans out parallel searches, runs a ReAct tool loop to gather context, drafts an answer, refines it via Reflection, then validates output before returning — each node exists to showcase exactly one LangGraph/agentic capability.
 
@@ -60,11 +60,10 @@ agent-app/
         ├── __init__.py
         ├── state.py           # AgentState TypedDict
         ├── workflow.py        # Graph + checkpointer assembly
-        ├── llm.py             # LiteLLM client factory
         ├── mcp_client.py      # fastmcp client factory; binds MCP tools for LangGraph
         └── nodes/
             ├── __init__.py
-            ├── _llm_invoke.py         # Centralised async LLM wrapper + error translation
+            ├── _llm_invoke.py         # Centralised async LLM wrapper + error translation + build_llm() factory
             ├── _dead_letter.py        # DeadLetterInfo TypedDict + with_dead_letter decorator + dead_letter_node
             ├── input_guard.py         # GUARDRAIL: blocks off-topic / unsafe input
             ├── planner.py             # Plans steps; interrupt() for human approval
@@ -203,7 +202,7 @@ search_subgraph = search_graph.compile()
 ### ReAct — Non-deterministic Steps (in `react_researcher`)
 
 `react_researcher` is a single node wired with a `ToolNode` in an open loop.
-The model decides when it has gathered enough context; there is no fixed iteration cap.
+The model decides when it has gathered enough context. A hard ceiling of `MAX_REACT_STEPS` (default 10, configurable via `AGENT_MAX_REACT_STEPS`) exits the loop even if the model keeps emitting `tool_calls` — the writer runs with whatever context was gathered.
 
 MCP tools are loaded **once** in `lifespan()` before the graph is compiled, then injected
 into both the node closure and `ToolNode`. This keeps the MCP connection alive for the
@@ -231,9 +230,11 @@ def compile_graph(
 
     # Cannot use the built-in tools_condition here: it returns "__end__" (not "writer")
     # when there are no tool_calls.  A custom condition is required.
+    # Also enforces the MAX_REACT_STEPS ceiling to prevent runaway tool loops.
     def react_condition(state: AgentState) -> Literal["tools", "writer"]:
         last = state["messages"][-1]
-        return "tools" if getattr(last, "tool_calls", None) else "writer"
+        ceiling_hit = state["react_steps"] >= settings.max_react_steps
+        return "tools" if getattr(last, "tool_calls", None) and not ceiling_hit else "writer"
 
     graph.add_conditional_edges("react_researcher", react_condition)
     graph.add_edge("tools", "react_researcher")
@@ -245,13 +246,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     mcp_tools = await load_mcp_tools(settings.mcp_server_url)   # await — get_tools() is async
     async with AsyncPostgresSaver.from_conn_string(settings.db_uri) as checkpointer:
         await checkpointer.setup()
-        app.state.graph = compile_graph(checkpointer, create_llm(), mcp_tools)
+        app.state.graph = compile_graph(checkpointer, build_llm(), mcp_tools)
         yield
 ```
 
 ### Reflection (inside `reflection_subgraph`)
 
-The subgraph loops: `critic` scores the draft answer against criteria (relevance, completeness, grounding); if it fails, `refiner` improves the draft and the critic re-evaluates. No hard cap — the loop exits on quality pass.
+The subgraph loops: `critic` scores the draft answer against criteria (relevance, completeness, grounding); if it fails, `refiner` improves the draft and the critic re-evaluates. The loop exits on quality pass **or when `reflection_attempts` reaches `MAX_REFLECTION_ATTEMPTS`** (default 5, configurable via `AGENT_MAX_REFLECTION_ATTEMPTS`). On ceiling hit the best draft is kept and `reflection_passed` is set to `False` — the output guard still runs.
 
 `ReflectionState` uses short internal keys (`draft`, `passed`) that differ from `AgentState`
 (`draft_answer`, `reflection_passed`). Because LangGraph only auto-merges **matching** keys,
@@ -265,8 +266,11 @@ class ReflectionState(TypedDict):
     reflection_attempts: int
     passed: bool
 
+MAX_REFLECTION_ATTEMPTS = settings.max_reflection_attempts  # default 5
+
 def should_refine(state: ReflectionState) -> Literal["refiner", END]:
-    return "refiner" if not state["passed"] else END
+    ceiling_hit = state["reflection_attempts"] >= MAX_REFLECTION_ATTEMPTS
+    return END if state["passed"] or ceiling_hit else "refiner"
 
 reflection_subgraph = reflection_graph.compile()
 
@@ -391,6 +395,84 @@ Nodes decorated with `@with_dead_letter("node_name")`: `input_guard`, `planner`,
 The two subgraphs (`search_subgraph`, `reflection_subgraph`) are wrapped at the parent level
 via the `after()` routing helper so internal subgraph exceptions still route to `dead_letter`.
 
+### Circuit Breakers & Loop Guards
+
+Four independent safeguards prevent runaway execution and uncontrolled cost growth.
+All limits are configurable via `AGENT_` env vars; defaults are conservative.
+
+#### 1 — Reflection ceiling (`AGENT_MAX_REFLECTION_ATTEMPTS`, default `5`)
+
+`should_refine` in `reflection_subgraph` exits when `reflection_attempts >= max_reflection_attempts`
+even if the critic has not passed. The writer's best draft is kept; `reflection_passed=False` propagates
+to the parent and the output guard still runs.
+
+#### 2 — ReAct ceiling (`AGENT_MAX_REACT_STEPS`, default `10`)
+
+`react_condition` in `workflow.py` routes to `"writer"` when `react_steps >= max_react_steps`,
+regardless of whether the model emitted `tool_calls`. The writer runs with whatever context was
+gathered — no tool results are lost.
+
+#### 3 — LLM call timeout (`AGENT_LLM_TIMEOUT_SECONDS`, default `60`)
+
+`_llm_invoke.py` wraps every `llm.ainvoke` / `llm.astream` call in `asyncio.wait_for` with
+`timeout=settings.llm_timeout_seconds`. On expiry, `asyncio.TimeoutError` is caught and
+re-raised as `LLMServiceUnavailableError` so the dead-letter decorator picks it up.
+
+```python
+# nodes/_llm_invoke.py
+async def llm_invoke(llm: BaseChatModel, messages: list[AnyMessage], config: RunnableConfig) -> AnyMessage:
+    try:
+        return await asyncio.wait_for(
+            llm.ainvoke(messages, config),
+            timeout=settings.llm_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise LLMServiceUnavailableError("LLM call timed out")
+    except Exception as exc:
+        raise _translate(exc)
+```
+
+#### 4 — Global pipeline step cap (`AGENT_MAX_PIPELINE_STEPS`, default `50`)
+
+LangGraph enforces `recursion_limit` as a hard ceiling on **supersteps** (one node execution = one superstep) per invocation. It is injected on every `ainvoke` / `astream_events` call in `routers.py`:
+
+```python
+config: RunnableConfig = {
+    "configurable": {"thread_id": ...},
+    "recursion_limit": settings.max_pipeline_steps,
+}
+```
+
+This is defense-in-depth on top of the per-loop ceilings. Worst-case superstep count for a normal run:
+`react(10) + reflection(5 × 2 nodes) + ~6 other nodes = ~26`. Default of `50` is generous for normal runs while bounding any routing bug that produces an unexpected loop. LangGraph raises `GraphRecursionError` when the limit is hit.
+
+#### 5 — Retry with exponential backoff (`AGENT_LLM_MAX_RETRIES`, default `3`)
+
+`_llm_invoke.py` retries on transient errors (`LLMRateLimitError`, `LLMServiceUnavailableError`)
+with exponential backoff (base `1s`, max `30s`). Non-retryable errors (`LLMError` base class)
+are re-raised immediately.
+
+```python
+# nodes/_llm_invoke.py
+async def llm_invoke_with_retry(llm: BaseChatModel, messages: list[AnyMessage], config: RunnableConfig) -> AnyMessage:
+    last_exc: Exception | None = None
+    for attempt in range(settings.llm_max_retries + 1):
+        try:
+            return await llm_invoke(llm, messages, config)
+        except (LLMRateLimitError, LLMServiceUnavailableError) as exc:
+            last_exc = exc
+            wait = min(2 ** attempt, 30)
+            await asyncio.sleep(wait)
+        except LLMError:
+            raise
+    raise last_exc  # type: ignore[misc]
+```
+
+All four limits are also exposed to the eval runner so experiments can be reproduced with
+different ceilings without redeploying.
+
+---
+
 ### Guardrails — Input and Output
 
 **Input guard** (`input_guard.py`): first node after `START`. Asks the LLM to classify the user's request as `safe` or `unsafe` against a system prompt that describes allowed topics. Routes to `END` immediately (sets `status="blocked"`, `guard_reason=...`) on failure — the planner never runs.
@@ -401,17 +483,29 @@ Both guards use a small, structured LLM call that returns `{"verdict": "safe"|"u
 
 ---
 
-## LLM Client (LiteLLM + Ollama)
+## LLM Client (LiteLLM + Unsloth / llama.cpp)
+
+`build_llm()` lives in `nodes/_llm_invoke.py` alongside the retry/timeout wrappers so all LLM concerns are co-located.
 
 ```python
-# graph/llm.py
+# nodes/_llm_invoke.py
 from langchain_community.chat_models import ChatLiteLLM
 
-def create_llm(model: str = "ollama/llama3.2", base_url: str = "http://localhost:11434") -> ChatLiteLLM:
-    return ChatLiteLLM(model=model, api_base=base_url)
+def build_llm() -> ChatLiteLLM:
+    # Qwen3 thinking mode: enable_thinking must go through model_kwargs so
+    # LiteLLM forwards it to the llama.cpp/Unsloth server.  ChatLiteLLM's own
+    # `thinking=` kwarg is Anthropic-specific and has no effect here.
+    return ChatLiteLLM(
+        model=settings.llm_model,
+        api_base=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model_kwargs={"enable_thinking": settings.llm_thinking},
+    )
 ```
 
-Config: `AGENT_LLM_MODEL` (default `ollama/llama3.2`), `AGENT_LLM_BASE_URL` (default `http://localhost:11434`).
+Config: `AGENT_LLM_MODEL` (default `openai/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit`), `AGENT_LLM_BASE_URL` (default `http://127.0.0.1:8888/v1`), `AGENT_LLM_THINKING` (default `false`), `AGENT_LLM_TIMEOUT_SECONDS` (default `60`), `AGENT_LLM_MAX_RETRIES` (default `3`), `AGENT_MAX_REFLECTION_ATTEMPTS` (default `5`), `AGENT_MAX_REACT_STEPS` (default `10`).
+
+Default model is [Unsloth Qwen3.6](https://unsloth.ai/docs/models/qwen3.6): MLX 4-bit variant running via Unsloth Studio on Apple Silicon. The `openai/` prefix tells LiteLLM to use the OpenAI-compatible endpoint.
 
 ---
 
@@ -610,6 +704,7 @@ dependencies = [
     "pyyaml>=6.0",
     "fastmcp>=2.0",
     "langchain-mcp-adapters>=0.1.3",           # pin patch: <0.1.3 has breaking tool schema bug
+    "logger",                                  # custom structlog wrapper: get_logger() + configure_logging()
 ]
 ```
 
@@ -621,14 +716,31 @@ Full local dev setup in order:
 
 1. **Prerequisites** — Docker, Python 3.13, uv, Ollama
 
-2. **Ollama setup**:
+2. **LLM inference server** (llama.cpp or Unsloth Studio):
+
+   **Option A — Unsloth Studio** (recommended; GUI, easier model management):
    ```bash
-   brew install ollama
-   ollama serve
-   # separate terminal
-   ollama pull llama3.2
-   ollama list
+   pip install unsloth-studio
+   unsloth studio -H 127.0.0.1 -p 8888
    ```
+   Then open **http://127.0.0.1:8888** in your browser. Search for
+   `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`, select the `UD-Q4_K_XL` quant, download it,
+   then click **Start**. Studio starts a llama.cpp server in the background and shows
+   the API port in the UI — note that port and set `AGENT_LLM_BASE_URL=http://127.0.0.1:<port>/v1`.
+
+   **Option B — llama.cpp server** (headless):
+   ```bash
+   # download model
+   hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF --include "*UD-Q4_K_XL*"
+   # start server on port 8001 (alias must match AGENT_LLM_MODEL)
+   ./llama.cpp/llama-server \
+     --model unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
+     --alias "unsloth/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" \
+     --spec-type draft-mtp --spec-draft-n-max 2 \
+     --ctx-size 16384 --port 8002
+   ```
+   OpenAI-compatible API available at `http://127.0.0.1:8002/v1` — set `AGENT_LLM_BASE_URL=http://127.0.0.1:8002/v1` if using this option instead of Studio.
+   Port 8001 is reserved for the MCP server (`AGENT_MCP_SERVER_URL` default).
 
 3. **Postgres**:
    ```bash
@@ -722,5 +834,7 @@ This separation means Studio can inspect the graph topology without starting a P
 
 - Ollama tests: skip live LLM calls by default (mock LLM); set `AGENT_RUN_LLM_TESTS=true` to hit real Ollama
 - MCP server tests: use in-process `fastmcp` test client; no network required
-- Reflection loop has no hard cap by design — add a soft ceiling (e.g., 5) only if runaway is a concern in practice
+- Reflection loop ceiling: `AGENT_MAX_REFLECTION_ATTEMPTS` (default 5); ReAct ceiling: `AGENT_MAX_REACT_STEPS` (default 10); both are intentionally finite to bound cost
+- LLM timeout: `AGENT_LLM_TIMEOUT_SECONDS` (default 60s); retries: `AGENT_LLM_MAX_RETRIES` (default 3, exponential backoff, transient errors only)
+- Global pipeline ceiling: `AGENT_MAX_PIPELINE_STEPS` (default 50) maps to LangGraph `recursion_limit`; raises `GraphRecursionError` if hit
 - LangGraph Studio is **free** (Mac desktop app); only LangGraph Cloud (hosted) is paid

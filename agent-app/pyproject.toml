@@ -20,6 +20,7 @@ dependencies = [
     "pyyaml>=6.0",
     "fastmcp>=2.0",
     "langchain-mcp-adapters>=0.1.3",
+    "logger",
 ]
 
 [dependency-groups]
@@ -70,7 +71,9 @@ venv = ".venv"
 [tool.taskipy.tasks]
 precommit = { cmd = "uvx ruff format . && uvx ruff check . --fix --unsafe-fixes && uvx pyright .", help = "Lint, format and typecheck Python codebase" }
 test = { cmd = "pytest", help = "Run the full test suite in parallel" }
-test-cov = { cmd = "pytest --cov=churn_lib --cov-report=term-missing", help = "Run tests with coverage report" }
+test-cov = { cmd = "pytest --cov=app --cov-report=term-missing", help = "Run tests with coverage report" }
+app = { cmd = "uvicorn app.main:app --reload", help = "Run the FastAPI app with auto-reload" }
+mcp = { cmd = "uvicorn app.mcp.server:mcp --host 0.0.0.0 --port 8001", help = "Run the MCP tool server" }
 
 [build-system]
 requires = ["hatchling"]
@@ -86,6 +89,7 @@ packages = ["app"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 addopts = "-n auto --dist loadscope --tb=short"
