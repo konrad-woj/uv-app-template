@@ -47,19 +47,35 @@ that specific historical state and continue from there:
   - ``"update"`` — state after ``aupdate_state()`` was called externally.
 """
 
+import json
+from collections.abc import AsyncGenerator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
 from app.config import settings
 from app.dependencies import get_graph
+from app.exceptions import LLMRateLimitError, LLMServiceError, LLMServiceUnavailableError
 from app.models import ChatRequest, ChatResponse, CheckpointInfo, ReplayRequest
 
 router = APIRouter()
+
+
+def _extract_interrupt_value(snapshot) -> dict | None:
+    """Extract the interrupt payload from the first suspended task in a snapshot."""
+    tasks = snapshot.tasks
+    if not tasks:
+        return None
+    raw = getattr(tasks[0], "interrupts", [None])[0]
+    if raw is None:
+        return None
+    return raw.value if hasattr(raw, "value") else None
 
 
 @router.get("/health", tags=["meta"])
@@ -95,20 +111,11 @@ async def chat(
 
     if is_interrupted:
         if request.approve is None:
-            # Thread is paused at an interrupt but caller didn't set approve.
-            # Re-read interrupt_value so the caller knows what they need to respond to.
-            interrupts = snapshot.tasks
-            interrupt_value = None
-            if interrupts:
-                first_task = interrupts[0]
-                raw = getattr(first_task, "interrupts", [None])[0]
-                if raw is not None:
-                    interrupt_value = raw.value if hasattr(raw, "value") else None
             return ChatResponse(
                 thread_id=request.thread_id,
                 status="interrupted",
                 is_interrupted=True,
-                interrupt_value=interrupt_value,
+                interrupt_value=_extract_interrupt_value(snapshot),
             )
         result = await graph.ainvoke(Command(resume=request.approve), config)
     else:
@@ -121,22 +128,100 @@ async def chat(
     # After invocation, check if the graph is now at a new interrupt.
     post_snapshot = await graph.aget_state(config)
     now_interrupted = bool(post_snapshot.next) and bool(post_snapshot.values)
-    interrupt_value = None
-    if now_interrupted:
-        interrupts = post_snapshot.tasks
-        if interrupts:
-            first_task = interrupts[0]
-            interrupt_value = getattr(first_task, "interrupts", [None])[0]
-            if interrupt_value is not None:
-                interrupt_value = interrupt_value.value if hasattr(interrupt_value, "value") else None
 
     return ChatResponse(
         thread_id=request.thread_id,
         status=result.get("status", "done"),
         is_interrupted=now_interrupted,
-        interrupt_value=interrupt_value,
+        interrupt_value=_extract_interrupt_value(post_snapshot) if now_interrupted else None,
         final_answer=result.get("final_answer"),
         guard_reason=result.get("guard_reason"),
+    )
+
+
+def _classify_error(exc: Exception) -> tuple[int, str]:
+    if isinstance(exc, LLMRateLimitError):
+        return 429, "LLM rate limit exceeded"
+    if isinstance(exc, LLMServiceUnavailableError):
+        return 503, "LLM service unavailable"
+    if isinstance(exc, LLMServiceError):
+        return 502, "LLM service error"
+    if isinstance(exc, GraphRecursionError):
+        return 500, "Pipeline step limit exceeded"
+    return 500, "Internal server error"
+
+
+async def _emit_interrupt(interrupt_value: dict | None) -> AsyncGenerator[str]:
+    yield f"event: interrupt\ndata: {json.dumps({'interrupt_value': interrupt_value})}\n\n"
+
+
+async def _generate(graph: CompiledStateGraph, graph_input, config: RunnableConfig, request: Request) -> AsyncGenerator[str]:
+    try:
+        async for event in graph.astream_events(graph_input, config, version="v2"):
+            if await request.is_disconnected():
+                return
+            if event["event"] == "on_chat_model_stream" and "writer" in event.get("tags", []):
+                token = event["data"]["chunk"].content
+                if isinstance(token, list):
+                    token = "".join(b.get("text", "") for b in token if isinstance(b, dict) and b.get("type") == "text")
+                if token:
+                    yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+    except Exception as exc:
+        code, detail = _classify_error(exc)
+        yield f"event: error\ndata: {json.dumps({'code': code, 'detail': detail})}\n\n"
+        return
+
+    snapshot = await graph.aget_state(config)
+    if bool(snapshot.next):
+        interrupt_value = _extract_interrupt_value(snapshot)
+        yield f"event: interrupt\ndata: {json.dumps({'interrupt_value': interrupt_value})}\n\n"
+    else:
+        state = snapshot.values
+        yield f"event: done\ndata: {json.dumps({'status': state.get('status', 'done'), 'final_answer': state.get('final_answer')})}\n\n"
+
+
+@router.post("/v1/chat/stream", tags=["chat"])
+async def chat_stream(
+    request: Request,
+    body: ChatRequest,
+    graph: Annotated[CompiledStateGraph, Depends(get_graph)],
+) -> StreamingResponse:
+    """Token-streaming variant of POST /v1/chat.
+
+    Returns a text/event-stream response. Frames:
+      event: token       — one LLM token from the writer node
+      event: interrupt   — graph paused at planner interrupt
+      event: done        — graph reached END
+      event: error       — unhandled exception escaped the graph
+
+    Resume an interrupt: call this endpoint again with the same thread_id
+    and approve=true or approve=false in the request body.
+    """
+    config: RunnableConfig = {
+        "configurable": {"thread_id": body.thread_id},
+        "recursion_limit": settings.max_pipeline_steps,
+    }
+
+    snapshot = await graph.aget_state(config)
+    is_interrupted = bool(snapshot.next) and snapshot.values
+
+    if is_interrupted and body.approve is None:
+        interrupt_value = _extract_interrupt_value(snapshot)
+        return StreamingResponse(
+            _emit_interrupt(interrupt_value),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    if is_interrupted:
+        graph_input = Command(resume=body.approve)
+    else:
+        graph_input = {"messages": [HumanMessage(content=body.message)], "status": "planning"}
+
+    return StreamingResponse(
+        _generate(graph, graph_input, config, request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

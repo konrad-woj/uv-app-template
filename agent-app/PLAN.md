@@ -688,7 +688,7 @@ Config: `AGENT_MCP_SERVER_URL` (default `http://localhost:8001`).
 
 ---
 
-### Phase 3 — Token Streaming (SSE)
+### Phase 3 — Token Streaming (SSE) ✓ DONE
 
 #### What Phase 3 is (and is not)
 
@@ -744,6 +744,7 @@ alongside LangGraph-internal tags. To avoid emitting tokens from `input_guard`, 
 both event type *and* the presence of `"writer"` in `event["tags"]`:
 
 ```python
+# "writer" must match the node name in workflow.py — if the node is renamed, update here too.
 if event["event"] == "on_chat_model_stream" and "writer" in event.get("tags", []):
     chunk: AIMessageChunk = event["data"]["chunk"]
     token = chunk.content
@@ -826,20 +827,31 @@ the non-streaming endpoint. There is no separate "resume stream" endpoint.
 #### Error handling
 
 `astream_events` propagates exceptions from inside nodes. Wrap the generator loop in a
-`try/except`:
+`try/except` that delegates to `_classify_error`:
 
 ```python
 async def _generate(graph, input_, config, request):
     try:
         async for event in graph.astream_events(input_, config, version="v2"):
             ...
-    except LLMRateLimitError:
-        yield f"event: error\ndata: {json.dumps({'code': 429, 'detail': 'LLM rate limit exceeded'})}\n\n"
-    except LLMServiceUnavailableError:
-        yield f"event: error\ndata: {json.dumps({'code': 503, 'detail': 'LLM service unavailable'})}\n\n"
-    except Exception:
-        yield f"event: error\ndata: {json.dumps({'code': 500, 'detail': 'Internal server error'})}\n\n"
+    except Exception as exc:
+        code, detail = _classify_error(exc)
+        yield f"event: error\ndata: {json.dumps({'code': code, 'detail': detail})}\n\n"
 ```
+
+`_classify_error` mapping:
+
+| Exception | Code | Detail |
+|---|---|---|
+| `LLMRateLimitError` | 429 | "LLM rate limit exceeded" |
+| `LLMServiceUnavailableError` | 503 | "LLM service unavailable" |
+| `LLMServiceError` | 502 | "LLM service error" |
+| `GraphRecursionError` | 500 | "Pipeline step limit exceeded" |
+| `Exception` | 500 | "Internal server error" |
+
+`GraphRecursionError` (raised by the LangGraph runner when `recursion_limit` is hit) is **not**
+caught by `with_dead_letter` — that decorator only wraps individual node functions, not the graph
+runner itself. It escapes `astream_events` and must be caught here.
 
 Note: because `with_dead_letter` catches all exceptions *inside* nodes and writes them to state
 instead of re-raising, the majority of node failures will **not** surface here — they'll produce
@@ -1013,11 +1025,45 @@ while (true) {
 
 ---
 
+#### SSE keepalive (not implemented in Phase 3 — see note below)
+
+The pipeline can be silent for minutes while the search subgraph and ReAct loop run before
+the writer emits its first token. Most reverse proxies (Nginx default: 60s, AWS ALB: 60s)
+close idle SSE connections during this silence. `X-Accel-Buffering: no` prevents output
+batching but does not prevent idle timeouts.
+
+The SSE spec supports comment-only frames as keepalive — `: ping\n\n`. Clients ignore them;
+proxies see traffic and reset their idle timer.
+
+`async for event in graph.astream_events(...)` blocks between events with no hook to inject
+frames mid-wait. The correct pattern wraps the iterator with `asyncio.wait_for` per event:
+
+```python
+async def _generate_with_keepalive(graph, graph_input, config, request, keepalive_seconds=15):
+    aiter = graph.astream_events(graph_input, config, version="v2").__aiter__()
+    while True:
+        try:
+            event = await asyncio.wait_for(aiter.__anext__(), timeout=keepalive_seconds)
+        except asyncio.TimeoutError:
+            yield ": ping\n\n"
+            continue
+        except StopAsyncIteration:
+            break
+        if await request.is_disconnected():
+            return
+        # ... process event normally (token / done / interrupt frames) ...
+```
+
+This adds meaningful complexity to `_generate`. Implement this in Phase 4 alongside other
+production hardening. For local development (no proxy) Phase 3 is correct as-is.
+
+---
+
 **Deliverables**:
-- `routers.py` — `chat_stream` endpoint + `_generate` async generator + `_emit_interrupt` async generator + `_classify_error` + `_extract_interrupt_value` helpers
+- `routers.py` — `chat_stream` endpoint + `_generate` async generator + `_emit_interrupt` async generator + `_classify_error` + `_extract_interrupt_value` helpers; `_extract_interrupt_value` is extracted from the existing inline logic in `chat` so both endpoints share one implementation
 - `graph/nodes/_llm_invoke.py` — add `streaming=True` to `build_llm()` so `astream_events` receives `on_chat_model_stream` chunks; safe for the non-streaming endpoint because `ainvoke` with streaming enabled still returns a complete aggregated message
 
-**Tests** (`tests/test_routers.py`):
+**Tests** (appended to existing `tests/test_routers.py`):
 - `test_stream_emits_token_frames` — mock writer LLM to return 3 chunks; assert 3 `event: token` frames arrive before `event: done`
 - `test_stream_interrupt_frame` — mock planner to interrupt; assert `event: interrupt` frame with `interrupt_value`
 - `test_stream_approve_none_on_interrupted_thread_emits_interrupt_frame` — thread is paused, POST without `approve`; assert single `event: interrupt` frame returned immediately, graph not invoked
@@ -1034,7 +1080,113 @@ finishes. `POST /v1/chat` behaviour is unchanged and its tests still pass.
 
 ---
 
-### Phase 4 — Evals (Langfuse + local HTTP runner)
+### Phase 4 — Security Hardening
+
+Addresses threats that arise when the app moves from local POC toward a shared or internet-facing deployment. Each item is independent and can be shipped incrementally; priority order matches risk severity.
+
+#### 4.1 — API Authentication
+
+All endpoints are currently unauthenticated. Any caller who can reach the port can invoke the full graph, consume LLM quota, and read checkpoint history for any thread.
+
+**Deliverables**:
+- `app/auth.py` — `APIKeyHeader` dependency that reads `X-API-Key` and validates against `AGENT_API_KEY` (loaded from env via `Settings`). Returns HTTP 401 on mismatch.
+- Apply the dependency globally via `app.include_router(router, dependencies=[Depends(verify_api_key)])` — one change point, covers all routes.
+- Exempt `/health` so liveness probes work without credentials.
+
+**Tests**:
+- `tests/test_auth.py` — missing key → 401, wrong key → 401, correct key → 200 on `/health`.
+
+#### 4.2 — Rate Limiting
+
+`POST /v1/chat` is expensive (LLM call + DB write per invocation). Without rate limiting a single client can exhaust the LLM token budget or flood the Postgres connection pool.
+
+**Deliverables**:
+- Add `slowapi` (ASGI-compatible, Redis-optional): `uv add slowapi`.
+- `app/rate_limit.py` — `Limiter` instance keyed on client IP; configurable via `AGENT_RATE_LIMIT` (e.g. `"20/minute"`).
+- Apply to `/v1/chat` and `/v1/threads/{thread_id}/replay` — the two endpoints that invoke the graph. `/health` and `/history` are exempt.
+- `429 Too Many Requests` response with `Retry-After` header.
+
+**Tests**:
+- `tests/test_rate_limit.py` — exceed limit → 429 with `Retry-After`; different IPs get independent counters.
+
+#### 4.3 — SSRF: DNS Rebinding & Hostname Resolution
+
+`_validate_url` in `mcp/server.py` checks URL strings before the HTTP request, which blocks obvious cases. It does **not** protect against DNS rebinding: a hostname like `attacker.com` could pass string validation but resolve to `127.0.0.1` at request time.
+
+**Deliverables**:
+- `app/mcp/ssrf.py` — `validate_url_and_host(url: str) -> str`:
+  1. Call existing `_validate_url` for scheme + literal-IP checks.
+  2. Resolve `parsed.hostname` via `socket.getaddrinfo` (async: `asyncio.get_event_loop().run_in_executor(None, ...)`) and re-validate every returned IP against the private-range blocklist.
+  3. Return the validated URL; raise `ValueError` on any violation.
+- Replace the `_validate_url` call in `fetch_url` with `validate_url_and_host`.
+- `max_results` in `web_search` capped at `AGENT_WEB_SEARCH_MAX_RESULTS` (default 10) to bound DuckDuckGo cost.
+
+**Tests**:
+- `tests/mcp/test_ssrf.py` — mock `getaddrinfo` to return a loopback IP for a legitimate-looking hostname → `ValueError`; public IP → passes.
+
+#### 4.4 — Request Size Limits & Input Bounds
+
+Unbounded inputs allow prompt-stuffing attacks (very long `message` fields that inflate LLM context and cost) and memory pressure from large request bodies.
+
+**Deliverables**:
+- `ChatRequest.message` — add `max_length=4096` Pydantic constraint. Messages beyond this are rejected at the boundary with HTTP 422 before any LLM is called.
+- `ChatRequest.thread_id` — add `max_length=128` constraint.
+- Uvicorn / FastAPI request body size limit: set `limit_concurrency` and add `app = FastAPI(..., max_request_size=65536)` or configure via reverse-proxy note in README.
+- `fetch_url.max_char` clamped server-side: `min(max_char, 8000)` to bound memory regardless of what the LLM requests.
+
+**Tests**:
+- `tests/test_models.py` — message over 4096 chars → `ValidationError`; thread_id over 128 chars → `ValidationError`.
+
+#### 4.5 — Prompt Injection Defence (Structured Prompts)
+
+The input guard classifies user intent but does not prevent a crafted user message from leaking into other nodes' system prompts. For example, a user message containing `\nIgnore previous instructions` is passed verbatim to the planner and writer.
+
+**Deliverables**:
+- `app/graph/nodes/_prompt_utils.py` — `sanitize_user_text(text: str) -> str`:
+  - Strip or escape common injection markers: leading/trailing XML-like tags (`<system>`, `</s>`), repeated newlines, null bytes.
+  - Apply in `input_guard`, `planner`, and `writer` where `last_human.content` is interpolated into prompts.
+- Planner and writer system prompts already use hard `"""` delimiters around user content; add explicit role labels (`User question:`, `---`) to structurally separate user content from system instructions.
+
+**Tests**:
+- `tests/graph/nodes/test_prompt_utils.py` — injection markers stripped; normal text passes through unchanged.
+
+#### 4.6 — Dependency Vulnerability Scanning
+
+No automated check currently flags known CVEs in the dependency tree.
+
+**Deliverables**:
+- Add `pip-audit` as a dev dependency: `uv add --dev pip-audit`.
+- `uv run task audit` → `pip-audit --require-hashes` (or without hashes for flexibility).
+- Add `audit` to the `precommit` task chain so CVE checks run on every pre-commit pass.
+- Pin all production dependencies to exact versions in `pyproject.toml` `[tool.uv.constraint]` or via `uv lock` (already done by default with `uv`).
+
+**Tests**:
+- No unit tests; CI gate: non-zero exit from `pip-audit` fails the build.
+
+---
+
+#### 4.7 — SSE Keepalive
+
+Long-running pipelines (search subgraph + ReAct loop) can be silent for minutes before the writer emits its first token. Reverse proxies (Nginx default: 60s, AWS ALB: 60s) close idle SSE connections during this silence.
+
+**Deliverables**:
+- Replace `_generate` in `routers.py` with `_generate_with_keepalive`: wrap `astream_events` iterator with `asyncio.wait_for` per event; emit `: ping\n\n` comment frames on `asyncio.TimeoutError` to reset proxy idle timers.
+- Keepalive interval configurable via `AGENT_SSE_KEEPALIVE_SECONDS` (default `15`); add to `Settings` and `config.py`.
+
+**Tests**:
+- `test_stream_keepalive_emits_ping` — mock `astream_events` to pause longer than keepalive interval; assert `: ping` comment frame emitted before first token.
+
+---
+
+**Done when**:
+- Unauthenticated requests to `/v1/chat` return 401.
+- A DNS-rebinding mock test passes in `tests/mcp/test_ssrf.py`.
+- `uv run task audit` exits 0 on the current dependency set.
+- A message of 5000 characters is rejected with 422 before reaching any LLM node.
+
+---
+
+### Phase 5 — Evals (Langfuse + local HTTP runner)
 
 #### Eval dataset and rubric (defined upfront, used from Phase 2 onward)
 
@@ -1063,7 +1215,7 @@ AND every per-criterion minimum is met.
 Trace assertions never call an LLM — failures indicate a wiring bug, not a quality problem.
 Assertions are organised per-node so each node can be tested in isolation.
 
-#### Phase 4 deliverables
+#### Phase 5 deliverables
 
 - `evals/configs/exp_baseline.yaml` — experiment config (base_url, dataset path, variants with different Ollama models)
 - `evals/create_dataset.py` — uploads `sample.yaml` to Langfuse dataset
@@ -1089,99 +1241,6 @@ Assertions are organised per-node so each node can be tested in isolation.
 
 ---
 
-### Phase 5 — Security Hardening
-
-Addresses threats that arise when the app moves from local POC toward a shared or internet-facing deployment. Each item is independent and can be shipped incrementally; priority order matches risk severity.
-
-#### 5.1 — API Authentication
-
-All endpoints are currently unauthenticated. Any caller who can reach the port can invoke the full graph, consume LLM quota, and read checkpoint history for any thread.
-
-**Deliverables**:
-- `app/auth.py` — `APIKeyHeader` dependency that reads `X-API-Key` and validates against `AGENT_API_KEY` (loaded from env via `Settings`). Returns HTTP 401 on mismatch.
-- Apply the dependency globally via `app.include_router(router, dependencies=[Depends(verify_api_key)])` — one change point, covers all routes.
-- Exempt `/health` so liveness probes work without credentials.
-
-**Tests**:
-- `tests/test_auth.py` — missing key → 401, wrong key → 401, correct key → 200 on `/health`.
-
-#### 5.2 — Rate Limiting
-
-`POST /v1/chat` is expensive (LLM call + DB write per invocation). Without rate limiting a single client can exhaust the LLM token budget or flood the Postgres connection pool.
-
-**Deliverables**:
-- Add `slowapi` (ASGI-compatible, Redis-optional): `pip install slowapi`.
-- `app/rate_limit.py` — `Limiter` instance keyed on client IP; configurable via `AGENT_RATE_LIMIT` (e.g. `"20/minute"`).
-- Apply to `/v1/chat` and `/v1/threads/{thread_id}/replay` — the two endpoints that invoke the graph. `/health` and `/history` are exempt.
-- `429 Too Many Requests` response with `Retry-After` header.
-
-**Tests**:
-- `tests/test_rate_limit.py` — exceed limit → 429 with `Retry-After`; different IPs get independent counters.
-
-#### 5.3 — SSRF: DNS Rebinding & Hostname Resolution
-
-`_validate_url` in `mcp/server.py` checks URL strings before the HTTP request, which blocks obvious cases. It does **not** protect against DNS rebinding: a hostname like `attacker.com` could pass string validation but resolve to `127.0.0.1` at request time.
-
-**Deliverables**:
-- `app/mcp/ssrf.py` — `validate_url_and_host(url: str) -> str`:
-  1. Call existing `_validate_url` for scheme + literal-IP checks.
-  2. Resolve `parsed.hostname` via `socket.getaddrinfo` (async: `asyncio.get_event_loop().run_in_executor(None, ...)`) and re-validate every returned IP against the private-range blocklist.
-  3. Return the validated URL; raise `ValueError` on any violation.
-- Replace the `_validate_url` call in `fetch_url` with `validate_url_and_host`.
-- `max_results` in `web_search` capped at `AGENT_WEB_SEARCH_MAX_RESULTS` (default 10) to bound DuckDuckGo cost.
-
-**Tests**:
-- `tests/mcp/test_ssrf.py` — mock `getaddrinfo` to return a loopback IP for a legitimate-looking hostname → `ValueError`; public IP → passes.
-
-#### 5.4 — Request Size Limits & Input Bounds
-
-Unbounded inputs allow prompt-stuffing attacks (very long `message` fields that inflate LLM context and cost) and memory pressure from large request bodies.
-
-**Deliverables**:
-- `ChatRequest.message` — add `max_length=4096` Pydantic constraint. Messages beyond this are rejected at the boundary with HTTP 422 before any LLM is called.
-- `ChatRequest.thread_id` — add `max_length=128` constraint.
-- Uvicorn / FastAPI request body size limit: set `limit_concurrency` and add `app = FastAPI(..., max_request_size=65536)` or configure via reverse-proxy note in README.
-- `fetch_url.max_char` clamped server-side: `min(max_char, 8000)` to bound memory regardless of what the LLM requests.
-
-**Tests**:
-- `tests/test_models.py` — message over 4096 chars → `ValidationError`; thread_id over 128 chars → `ValidationError`.
-
-#### 5.5 — Prompt Injection Defence (Structured Prompts)
-
-The input guard classifies user intent but does not prevent a crafted user message from leaking into other nodes' system prompts. For example, a user message containing `\nIgnore previous instructions` is passed verbatim to the planner and writer.
-
-**Deliverables**:
-- `app/graph/nodes/_prompt_utils.py` — `sanitize_user_text(text: str) -> str`:
-  - Strip or escape common injection markers: leading/trailing XML-like tags (`<system>`, `</s>`), repeated newlines, null bytes.
-  - Apply in `input_guard`, `planner`, and `writer` where `last_human.content` is interpolated into prompts.
-- Planner and writer system prompts already use hard `"""` delimiters around user content; add explicit role labels (`User question:`, `---`) to structurally separate user content from system instructions.
-
-**Tests**:
-- `tests/graph/nodes/test_prompt_utils.py` — injection markers stripped; normal text passes through unchanged.
-
-#### 5.6 — Dependency Vulnerability Scanning
-
-No automated check currently flags known CVEs in the dependency tree.
-
-**Deliverables**:
-- Add `pip-audit` as a dev dependency: `uv add --dev pip-audit`.
-- `uv run task audit` → `pip-audit --require-hashes` (or without hashes for flexibility).
-- Add `audit` to the `precommit` task chain so CVE checks run on every pre-commit pass.
-- Pin all production dependencies to exact versions in `pyproject.toml` `[tool.uv.constraint]` or via `uv lock` (already done by default with `uv`).
-
-**Tests**:
-- No unit tests; CI gate: non-zero exit from `pip-audit` fails the build.
-
----
-
-**Done when**:
-- Unauthenticated requests to `/v1/chat` return 401.
-- A DNS-rebinding mock test passes in `tests/mcp/test_ssrf.py`.
-- `uv run task audit` exits 0 on the current dependency set.
-- A message of 5000 characters is rejected with 422 before reaching any LLM node.
-
----
-
 ## Dependencies
 
 ```toml
@@ -1202,6 +1261,11 @@ dependencies = [
     "fastmcp>=2.0",
     "langchain-mcp-adapters>=0.1.3",           # pin patch: <0.1.3 has breaking tool schema bug
     "logger",                                  # custom structlog wrapper: get_logger() + configure_logging()
+    "slowapi>=0.1",                            # Phase 4: rate limiting (ASGI-compatible, Redis-optional)
+]
+
+dev_dependencies = [
+    "pip-audit",                               # Phase 4: dependency vulnerability scanning
 ]
 ```
 
@@ -1323,7 +1387,8 @@ This separation means Studio can inspect the graph topology without starting a P
 - **Phase 1**: `uv run pytest tests/ -k "checkpoint or time_travel"` passes; `curl http://localhost:8000/health` → 200
 - **Phase 2**: multi-turn interrupt/resume via curl; subgraph nodes visible in checkpoint history; `uv run python -m app.mcp.server` starts; guardrail blocks a test prompt
 - **Phase 3**: `curl -N -X POST /v1/chat/stream` emits token frames
-- **Phase 4**: `uv run task experiment` writes results JSON; both quality scores and trace assertion results visible in Langfuse UI
+- **Phase 4**: unauthenticated requests return 401; DNS-rebinding mock test passes; `uv run task audit` exits 0; 5000-char message rejected with 422
+- **Phase 5**: `uv run task experiment` writes results JSON; both quality scores and trace assertion results visible in Langfuse UI
 
 ---
 

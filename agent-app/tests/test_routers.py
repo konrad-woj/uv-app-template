@@ -1,4 +1,4 @@
-"""Router-level tests for /health, /v1/chat, and /v1/threads/* endpoints.
+"""Router-level tests for /health, /v1/chat, /v1/chat/stream, and /v1/threads/* endpoints.
 
 Uses a standalone FastAPI app (no lifespan) with the graph dependency overridden
 by a mock, so no Postgres or MCP server is required.
@@ -10,11 +10,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage
 from langgraph.types import Command
 
 from app.dependencies import get_graph
-from app.routers import router
+from app.exceptions import LLMRateLimitError
+from app.routers import _classify_error, _generate, router
 
 _app = FastAPI()
 _app.include_router(router)
@@ -322,3 +323,288 @@ class TestReplay:
     async def test_missing_checkpoint_id_returns_422(self, client: AsyncClient) -> None:
         response = await client.post("/v1/threads/t-1/replay", json={})
         assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# SSE helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_sse(text: str) -> list[dict]:
+    """Parse SSE text into a list of {"event": ..., "data": ...} dicts."""
+    frames = []
+    for block in text.strip().split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        event_type = None
+        data = None
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+            elif line.startswith("data:"):
+                import json
+
+                data = json.loads(line[5:].strip())
+        if event_type is not None:
+            frames.append({"event": event_type, "data": data})
+    return frames
+
+
+def _make_stream_event(content: str, tags: list[str]) -> dict:
+    chunk = AIMessageChunk(content=content)
+    return {"event": "on_chat_model_stream", "tags": tags, "data": {"chunk": chunk}}
+
+
+def _astream(*events):
+    """Return an async generator of events — use as astream_events return value."""
+
+    async def _gen(*args, **kwargs):
+        for e in events:
+            yield e
+
+    return _gen()
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/chat/stream
+# ---------------------------------------------------------------------------
+
+
+class TestChatStream:
+    async def test_stream_emits_token_frames(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        mock_graph.aget_state = AsyncMock(
+            side_effect=[
+                _snapshot(),  # pre-invoke check
+                _snapshot(values={"status": "done", "final_answer": "Result"}),  # post-stream check
+            ]
+        )
+        events = [
+            _make_stream_event("The", ["writer"]),
+            _make_stream_event(" answer", ["writer"]),
+            _make_stream_event(" is here", ["writer"]),
+        ]
+        mock_graph.astream_events = MagicMock(return_value=_astream(*events))
+
+        response = await client.post("/v1/chat/stream", json={"thread_id": "t-s1", "message": "Research AI"})
+
+        frames = _parse_sse(response.text)
+        token_frames = [f for f in frames if f["event"] == "token"]
+        assert len(token_frames) == 3
+        assert token_frames[0]["data"]["token"] == "The"
+        assert token_frames[1]["data"]["token"] == " answer"
+        assert token_frames[2]["data"]["token"] == " is here"
+        done_frames = [f for f in frames if f["event"] == "done"]
+        assert len(done_frames) == 1
+
+    async def test_stream_interrupt_frame(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        mock_graph.aget_state = AsyncMock(
+            side_effect=[
+                _snapshot(),  # pre-invoke: not interrupted
+                _interrupted_snapshot({"plan": ["Step A", "Step B"]}),  # post-stream: interrupted
+            ]
+        )
+        mock_graph.astream_events = MagicMock(return_value=_astream())
+
+        response = await client.post("/v1/chat/stream", json={"thread_id": "t-s2", "message": "Research topic"})
+
+        frames = _parse_sse(response.text)
+        assert len(frames) == 1
+        assert frames[0]["event"] == "interrupt"
+        assert frames[0]["data"]["interrupt_value"] == {"plan": ["Step A", "Step B"]}
+
+    async def test_stream_approve_none_on_interrupted_thread_emits_interrupt_frame(
+        self, client: AsyncClient, mock_graph: MagicMock
+    ) -> None:
+        mock_graph.aget_state = AsyncMock(return_value=_interrupted_snapshot({"plan": ["Step 1"]}))
+
+        response = await client.post("/v1/chat/stream", json={"thread_id": "t-s3", "message": "anything"})
+
+        frames = _parse_sse(response.text)
+        assert len(frames) == 1
+        assert frames[0]["event"] == "interrupt"
+        assert frames[0]["data"]["interrupt_value"] == {"plan": ["Step 1"]}
+        mock_graph.astream_events.assert_not_called()
+
+    async def test_stream_resume_via_stream_endpoint(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        mock_graph.aget_state = AsyncMock(
+            side_effect=[
+                _interrupted_snapshot(),  # pre-invoke: interrupted
+                _snapshot(values={"status": "done", "final_answer": "Done"}),  # post-stream
+            ]
+        )
+        mock_graph.astream_events = MagicMock(return_value=_astream(_make_stream_event("Done", ["writer"])))
+
+        response = await client.post(
+            "/v1/chat/stream", json={"thread_id": "t-s4", "message": "approve", "approve": True}
+        )
+
+        frames = _parse_sse(response.text)
+        token_frames = [f for f in frames if f["event"] == "token"]
+        assert len(token_frames) == 1
+        done_frames = [f for f in frames if f["event"] == "done"]
+        assert len(done_frames) == 1
+        assert done_frames[0]["data"]["status"] == "done"
+
+        invoked_input = mock_graph.astream_events.call_args[0][0]
+        assert isinstance(invoked_input, Command)
+        assert invoked_input.resume is True
+
+    async def test_stream_done_frame_carries_status_and_answer(
+        self, client: AsyncClient, mock_graph: MagicMock
+    ) -> None:
+        mock_graph.aget_state = AsyncMock(
+            side_effect=[
+                _snapshot(),
+                _snapshot(values={"status": "done", "final_answer": "The final answer"}),
+            ]
+        )
+        mock_graph.astream_events = MagicMock(return_value=_astream())
+
+        response = await client.post("/v1/chat/stream", json={"thread_id": "t-s5", "message": "Research"})
+
+        frames = _parse_sse(response.text)
+        assert len(frames) == 1
+        assert frames[0]["event"] == "done"
+        assert frames[0]["data"]["status"] == "done"
+        assert frames[0]["data"]["final_answer"] == "The final answer"
+
+    async def test_stream_error_frame_on_rate_limit(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot())
+
+        async def _failing_stream(*args, **kwargs):
+            raise LLMRateLimitError("rate limited")
+            yield  # make it an async generator
+
+        mock_graph.astream_events = MagicMock(return_value=_failing_stream())
+
+        response = await client.post("/v1/chat/stream", json={"thread_id": "t-s6", "message": "Research"})
+
+        frames = _parse_sse(response.text)
+        assert len(frames) == 1
+        assert frames[0]["event"] == "error"
+        assert frames[0]["data"]["code"] == 429
+        assert frames[0]["data"]["detail"] == "LLM rate limit exceeded"
+
+    async def test_stream_no_tokens_from_guard_nodes(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        mock_graph.aget_state = AsyncMock(
+            side_effect=[
+                _snapshot(),
+                _snapshot(values={"status": "done", "final_answer": "ok"}),
+            ]
+        )
+        events = [
+            _make_stream_event("guard token", ["input_guard"]),
+            _make_stream_event("planner token", ["planner"]),
+            _make_stream_event("writer token", ["writer"]),
+            _make_stream_event("output token", ["output_guard"]),
+        ]
+        mock_graph.astream_events = MagicMock(return_value=_astream(*events))
+
+        response = await client.post("/v1/chat/stream", json={"thread_id": "t-s7", "message": "Research"})
+
+        frames = _parse_sse(response.text)
+        token_frames = [f for f in frames if f["event"] == "token"]
+        assert len(token_frames) == 1
+        assert token_frames[0]["data"]["token"] == "writer token"
+
+    async def test_stream_thinking_mode_list_content_emits_text_only(
+        self, client: AsyncClient, mock_graph: MagicMock
+    ) -> None:
+        mock_graph.aget_state = AsyncMock(
+            side_effect=[
+                _snapshot(),
+                _snapshot(values={"status": "done", "final_answer": "Result"}),
+            ]
+        )
+        thinking_chunk = AIMessageChunk(content=[{"type": "thinking", "thinking": "internal reasoning"}])
+        text_chunk = AIMessageChunk(content=[{"type": "text", "text": "Final answer"}])
+        events = [
+            {"event": "on_chat_model_stream", "tags": ["writer"], "data": {"chunk": thinking_chunk}},
+            {"event": "on_chat_model_stream", "tags": ["writer"], "data": {"chunk": text_chunk}},
+        ]
+        mock_graph.astream_events = MagicMock(return_value=_astream(*events))
+
+        response = await client.post("/v1/chat/stream", json={"thread_id": "t-s9", "message": "Research"})
+
+        frames = _parse_sse(response.text)
+        token_frames = [f for f in frames if f["event"] == "token"]
+        assert len(token_frames) == 1
+        assert token_frames[0]["data"]["token"] == "Final answer"
+
+    async def test_stream_dead_lettered_arrives_as_done(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        mock_graph.aget_state = AsyncMock(
+            side_effect=[
+                _snapshot(),
+                _snapshot(values={"status": "dead_lettered", "final_answer": None}),
+            ]
+        )
+        mock_graph.astream_events = MagicMock(return_value=_astream())
+
+        response = await client.post("/v1/chat/stream", json={"thread_id": "t-s8", "message": "Research"})
+
+        frames = _parse_sse(response.text)
+        assert len(frames) == 1
+        assert frames[0]["event"] == "done"
+        assert frames[0]["data"]["status"] == "dead_lettered"
+
+    async def test_stream_disconnect_stops_generator(self) -> None:
+        mock_graph = MagicMock()
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot(values={"status": "done"}))
+
+        events = [_make_stream_event(f"token {i}", ["writer"]) for i in range(10)]
+        mock_graph.astream_events = MagicMock(return_value=_astream(*events))
+
+        mock_request = MagicMock()
+        mock_request.is_disconnected = AsyncMock(return_value=True)
+
+        from langchain_core.runnables import RunnableConfig
+
+        config: RunnableConfig = {"configurable": {"thread_id": "t-disc"}, "recursion_limit": 50}
+        graph_input = {"messages": [HumanMessage(content="test")], "status": "planning"}
+
+        collected = []
+        async for frame in _generate(mock_graph, graph_input, config, mock_request):
+            collected.append(frame)
+
+        assert collected == []
+
+
+# ---------------------------------------------------------------------------
+# _classify_error unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyError:
+    def test_rate_limit_error(self) -> None:
+        from app.exceptions import LLMRateLimitError
+
+        code, detail = _classify_error(LLMRateLimitError("x"))
+        assert code == 429
+        assert detail == "LLM rate limit exceeded"
+
+    def test_service_unavailable_error(self) -> None:
+        from app.exceptions import LLMServiceUnavailableError
+
+        code, detail = _classify_error(LLMServiceUnavailableError("x"))
+        assert code == 503
+        assert detail == "LLM service unavailable"
+
+    def test_service_error(self) -> None:
+        from app.exceptions import LLMServiceError
+
+        code, detail = _classify_error(LLMServiceError("x"))
+        assert code == 502
+        assert detail == "LLM service error"
+
+    def test_graph_recursion_error(self) -> None:
+        from langgraph.errors import GraphRecursionError
+
+        code, detail = _classify_error(GraphRecursionError())
+        assert code == 500
+        assert detail == "Pipeline step limit exceeded"
+
+    def test_unknown_error(self) -> None:
+        code, detail = _classify_error(RuntimeError("something"))
+        assert code == 500
+        assert detail == "Internal server error"
