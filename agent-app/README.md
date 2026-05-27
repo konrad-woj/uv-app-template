@@ -17,7 +17,6 @@ Each node in the graph is a vehicle for exactly one LangGraph or agentic pattern
 | **Guardrails** | `input_guard`, `output_guard` | LLM-based safety/relevance check at graph entry and exit |
 | **Dead letter** | `dead_letter` terminal node | Any unhandled node exception writes `DeadLetterInfo` to state and routes here instead of crashing |
 | **Time-travel** | `GET /v1/threads/{id}/history`, `POST /v1/threads/{id}/replay` | Postgres checkpointer stores every state snapshot; replay re-invokes from any checkpoint |
-| **SSE streaming** | `POST /v1/chat/stream` | `astream_events(version="v2")` filtered to `on_chat_model_stream` |
 
 ## Reliability safeguards
 
@@ -42,6 +41,8 @@ All limits are configurable via `AGENT_` env vars.
 
 ### 1. Postgres
 
+We use port 5433 to avoid conflicts with any existing Postgres instances you might have running on the default port.
+
 ```bash
 docker run --name langgraph-db \
   -e POSTGRES_PASSWORD=postgres \
@@ -55,11 +56,13 @@ docker run --name langgraph-db \
 
 **Option A — Unsloth Studio** (recommended; GUI, easier model management):
 
+See https://unsloth.ai/docs/get-started/install
+
 ```bash
-pip install unsloth-studio
+curl -fsSL https://unsloth.ai/install.sh | sh
 unsloth studio -H 127.0.0.1 -p 8888
 # Open http://127.0.0.1:8888, download unsloth/Qwen3.6-35B-A3B-MTP-GGUF (UD-Q4_K_XL quant), click Start.
-# Set AGENT_LLM_BASE_URL=http://127.0.0.1:<port>/v1 to the port shown in Studio.
+# Set AGENT_LLM_BASE_URL=http://127.0.0.1:8888/v1 to the port shown in Studio.
 ```
 
 **Option B — llama.cpp server** (headless):
@@ -71,7 +74,7 @@ hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF --include "*UD-Q4_K_XL*"
   --alias "unsloth/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" \
   --ctx-size 16384 --port 8002
 # Set AGENT_LLM_BASE_URL=http://127.0.0.1:8002/v1
-# Port 8001 is reserved for the MCP server (AGENT_MCP_SERVER_URL default).
+# Port 8001 is reserved for the MCP server.
 ```
 
 ### 3. MCP server (Phase 2+, separate terminal)
@@ -118,11 +121,15 @@ All variables use the `AGENT_` prefix. Defaults work for local development.
 | `AGENT_LLM_THINKING` | `false` | Enable Qwen3 chain-of-thought mode |
 | `AGENT_LLM_TIMEOUT_SECONDS` | `60` | Per-call LLM timeout in seconds |
 | `AGENT_LLM_MAX_RETRIES` | `3` | Retries for transient LLM errors (exponential backoff) |
-| `AGENT_MCP_SERVER_URL` | `http://localhost:8001` | MCP tool server URL |
+| `AGENT_MCP_SERVER_URL` | `http://localhost:8001/mcp` | MCP tool server URL |
 | `AGENT_MAX_REFLECTION_ATTEMPTS` | `5` | Hard ceiling on reflection critic/refiner iterations |
 | `AGENT_MAX_REACT_STEPS` | `10` | Hard ceiling on ReAct tool-call iterations |
 | `AGENT_MAX_PIPELINE_STEPS` | `50` | LangGraph `recursion_limit`: total supersteps across the whole pipeline per invocation |
-| `AGENT_LOG_LEVEL` | `INFO` | Logging verbosity: DEBUG, INFO, WARNING, ERROR |
+| `AGENT_APP_HOST` | `0.0.0.0` | Bind host for the FastAPI app |
+| `AGENT_APP_PORT` | `8000` | Bind port for the FastAPI app |
+| `AGENT_MCP_HOST` | `0.0.0.0` | Bind host for the MCP tool server |
+| `AGENT_MCP_PORT` | `8001` | Bind port for the MCP tool server |
+| `AGENT_LOG_LEVEL` | `INFO` | Logging verbosity (consumed by the `logger` package): DEBUG, INFO, WARNING, ERROR |
 
 ## API
 
@@ -132,7 +139,6 @@ All variables use the `AGENT_` prefix. Defaults work for local development.
 | `POST` | `/v1/chat` | Invoke the agent (first turn or interrupt resume) |
 | `GET` | `/v1/threads/{id}/history` | Full checkpoint list for a thread (time-travel) |
 | `POST` | `/v1/threads/{id}/replay` | Re-invoke from a named checkpoint |
-| `POST` | `/v1/chat/stream` | SSE token stream (Phase 3) |
 
 ### Example
 
@@ -145,7 +151,7 @@ curl -s -X POST http://localhost:8000/v1/chat \
 # Resume after human-in-the-loop interrupt (approve the plan)
 curl -s -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"thread_id": "session-1", "message": "", "resume": true}' | jq
+  -d '{"thread_id": "session-1", "message": "approve", "approve": true}' | jq
 
 # Retrieve checkpoint history
 curl -s http://localhost:8000/v1/threads/session-1/history | jq
@@ -155,10 +161,6 @@ curl -s -X POST http://localhost:8000/v1/threads/session-1/replay \
   -H "Content-Type: application/json" \
   -d '{"checkpoint_id": "<id_from_history>"}' | jq
 
-# Stream tokens (Phase 3)
-curl -N -X POST http://localhost:8000/v1/chat/stream \
-  -H "Content-Type: application/json" \
-  -d '{"thread_id": "session-2", "message": "What is RAG?"}'
 ```
 
 ## Tests
@@ -166,6 +168,11 @@ curl -N -X POST http://localhost:8000/v1/chat/stream \
 ```bash
 # Full suite (requires Postgres on localhost:5433)
 uv run pytest
+# or via taskipy
+uv run task test
+
+# With coverage report
+uv run task test-cov
 
 # Models only — no Postgres needed
 uv run pytest tests/test_models.py

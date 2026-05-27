@@ -9,7 +9,6 @@ dependencies = [
     "uvicorn[standard]>=0.34",
     "pydantic-settings>=2.9",
     "litellm>=1.70",
-    "langchain-community>=0.3",
     "langchain-core>=0.3",
     "langgraph>=1.2",
     "langgraph-checkpoint-postgres>=3.1",
@@ -21,10 +20,12 @@ dependencies = [
     "fastmcp>=2.0",
     "langchain-mcp-adapters>=0.1.3",
     "logger",
+    "langchain-litellm>=0.6.6",
 ]
 
 [dependency-groups]
 dev = [
+    "langgraph-cli[inmem]",
     "pytest>=9.0.3",
     "pytest-cov",
     "pytest-asyncio",
@@ -72,8 +73,8 @@ venv = ".venv"
 precommit = { cmd = "uvx ruff format . && uvx ruff check . --fix --unsafe-fixes && uvx pyright .", help = "Lint, format and typecheck Python codebase" }
 test = { cmd = "pytest", help = "Run the full test suite in parallel" }
 test-cov = { cmd = "pytest --cov=app --cov-report=term-missing", help = "Run tests with coverage report" }
-app = { cmd = "uvicorn app.main:app --reload", help = "Run the FastAPI app with auto-reload" }
 mcp = { cmd = "uvicorn app.mcp.server:mcp --host 0.0.0.0 --port 8001", help = "Run the MCP tool server" }
+app = { cmd = "uvicorn app.main:app --reload", help = "Run the FastAPI app with auto-reload" }
 
 [build-system]
 requires = ["hatchling"]

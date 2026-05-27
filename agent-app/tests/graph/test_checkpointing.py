@@ -2,7 +2,7 @@ import uuid
 
 from langchain_core.messages import HumanMessage
 
-from app.graph.workflow import compile_graph
+from app.graph.workflow import compile_simple_graph
 from tests.conftest import langgraph_config
 
 
@@ -15,7 +15,7 @@ class TestSessionContinuation:
         This test confirms that the second invocation sees both human messages
         from turn 1 and turn 2 in the accumulated state.
         """
-        graph = compile_graph(async_checkpointer)
+        graph = compile_simple_graph(async_checkpointer)
         tid = f"test-accumulate-{uuid.uuid4()}"
 
         await graph.ainvoke({"messages": [HumanMessage("Hello!")], "status": "planning"}, langgraph_config(tid))
@@ -37,10 +37,10 @@ class TestSessionContinuation:
         """
         tid = f"test-persist-{uuid.uuid4()}"
 
-        graph1 = compile_graph(async_checkpointer)
+        graph1 = compile_simple_graph(async_checkpointer)
         await graph1.ainvoke({"messages": [HumanMessage("First message")], "status": "planning"}, langgraph_config(tid))
 
-        graph2 = compile_graph(async_checkpointer)
+        graph2 = compile_simple_graph(async_checkpointer)
         result = await graph2.ainvoke(
             {"messages": [HumanMessage("Second message")], "status": "planning"}, langgraph_config(tid)
         )
@@ -58,7 +58,7 @@ class TestSessionContinuation:
           source=loop   — after __end__ (the final "done" snapshot)
         3 invocations × 4 checkpoints = 12 total in aget_state_history.
         """
-        graph = compile_graph(async_checkpointer)
+        graph = compile_simple_graph(async_checkpointer)
         tid = f"test-count-{uuid.uuid4()}"
 
         for i in range(3):

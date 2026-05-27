@@ -1,79 +1,201 @@
 """Graph assembly for the research-assistant agent.
 
 Exposes two functions:
-  create_graph()   — returns the uncompiled StateGraph (used by LangGraph Studio).
-  compile_graph()  — compiles with a checkpointer (used by main.py lifespan).
+  create_graph()   — returns the uncompiled StateGraph (LangGraph Studio).
+  compile_graph()  — compiles with checkpointer + LLM + MCP tools (main.py lifespan).
 
-Phase 1 graph: START → planner → writer → END (stub nodes, no LLM).
+Full Phase 2 graph:
+  START → input_guard → planner (interrupt) → search_subgraph → react_researcher
+         → writer → reflection_subgraph → output_guard → END
 
-Phase 2 will replace stub nodes with the full node set and wire react_condition
-(with the MAX_REACT_STEPS ceiling) between react_researcher and tools/writer.
+Dead-letter routing: every node that can raise is wrapped with @with_dead_letter.
+The after() helper is used on each outgoing edge to detect dead_letter before
+routing to the next planned node.  The terminal dead_letter node is added once.
+
+Subgraph wrappers: search and reflection subgraphs use disjoint state keys and
+must be invoked via wrapper nodes that translate AgentState ↔ internal state.
 """
 
+from collections.abc import Callable, Mapping
 from typing import Literal
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.prebuilt import ToolNode
 
 from app.config import settings
+from app.graph.nodes._dead_letter import after, dead_letter_node
+from app.graph.nodes._llm_invoke import NodeLLMConfig, build_llm
+from app.graph.nodes.input_guard import make_input_guard_node
+from app.graph.nodes.output_guard import make_output_guard_node
+from app.graph.nodes.planner import make_planner_node
+from app.graph.nodes.react_researcher import make_react_researcher_node_from_llm
+from app.graph.nodes.subgraphs.reflection import ReflectionState, build_reflection_subgraph
+from app.graph.nodes.subgraphs.search import SearchState, search_subgraph
+from app.graph.nodes.writer import make_writer_node
 from app.graph.state import AgentState
 
 
-def react_condition(state: AgentState) -> Literal["tools", "writer"]:
+def _react_condition(state: AgentState) -> Literal["tools", "writer"]:
     """Route after react_researcher: loop back to tools or proceed to writer.
 
-    Exits to writer when the model stops emitting tool_calls OR when
-    react_steps reaches the configured ceiling (AGENT_MAX_REACT_STEPS).
-    The ceiling prevents runaway tool loops that never self-terminate.
+    Routes to writer when model stops emitting tool_calls OR when react_steps
+    reaches the AGENT_MAX_REACT_STEPS ceiling.
     """
     last = state["messages"][-1]
     ceiling_hit = state.get("react_steps", 0) >= settings.max_react_steps
     return "tools" if getattr(last, "tool_calls", None) and not ceiling_hit else "writer"
 
 
-async def planner_node(state: AgentState, config: RunnableConfig) -> dict:
-    last_human = next(
-        (msg for msg in reversed(state["messages"]) if isinstance(msg, HumanMessage)),
-        None,
-    )
-    content = last_human.content if last_human else ""
-    plan = [f"Research: {content}"]
-    return {
-        "plan": plan,
-        "status": "searching",
-        "messages": [AIMessage(content=f"Plan created for: {content}")],
+def _input_guard_condition(state: AgentState) -> Literal["planner", "dead_letter", "__end__"]:
+    """Route after input_guard: exception → dead_letter, blocked → END, safe → planner."""
+    if state.get("dead_letter"):
+        return "dead_letter"
+    return "__end__" if state.get("status") == "blocked" else "planner"
+
+
+def _planner_condition(state: AgentState) -> Literal["search_subgraph", "dead_letter", "__end__"]:
+    """Route after planner: exception → dead_letter, aborted → END, approved → search."""
+    if state.get("dead_letter"):
+        return "dead_letter"
+    return "__end__" if state.get("status") == "aborted" else "search_subgraph"
+
+
+async def _run_search(state: AgentState, config: RunnableConfig) -> dict:
+    """Wrapper node that maps AgentState → SearchState → AgentState."""
+    search_input: SearchState = {
+        "queries": state.get("plan", []),  # type: ignore[arg-type]
+        "query": "",
+        "results": [],
     }
+    result = await search_subgraph.ainvoke(search_input, config)
+    return {"search_results": result["results"], "status": "researching"}
 
 
-async def writer_node(state: AgentState, config: RunnableConfig) -> dict:
-    plan_summary = " | ".join(state.get("plan", []))  # type: ignore[arg-type]
-    answer = f"Draft answer for: {plan_summary}"
-    return {
-        "draft_answer": answer,
-        "final_answer": answer,
-        "status": "done",
-        "messages": [AIMessage(content=answer)],
-    }
+def _make_run_reflection(llm: BaseChatModel) -> Callable:
+    """Return a wrapper node that maps AgentState → ReflectionState → AgentState."""
+    compiled = build_reflection_subgraph(llm)
+
+    async def run_reflection(state: AgentState, config: RunnableConfig) -> dict:
+        reflection_input: ReflectionState = {
+            "draft": state.get("draft_answer", ""),
+            "critique": "",
+            "reflection_attempts": state.get("reflection_attempts", 0),
+            "passed": False,
+        }
+        result = await compiled.ainvoke(reflection_input, config)
+        return {
+            "final_answer": result["draft"],
+            "reflection_passed": result["passed"],
+            "reflection_attempts": result["reflection_attempts"],
+            "status": "done" if result["passed"] else "reflecting",
+        }
+
+    return run_reflection
 
 
-def _build_graph() -> StateGraph:
+def _build_graph(
+    default_llm: BaseChatModel,
+    mcp_tools: list[BaseTool],
+    node_llms: Mapping[str, BaseChatModel] | None = None,
+) -> StateGraph:
+    nlm = node_llms or {}
     graph: StateGraph = StateGraph(AgentState)
-    graph.add_node("planner", planner_node)
-    graph.add_node("writer", writer_node)
-    graph.add_edge(START, "planner")
-    graph.add_edge("planner", "writer")
-    graph.add_edge("writer", END)
+
+    # Nodes — each falls back to default_llm when not overridden
+    graph.add_node("input_guard", make_input_guard_node(nlm.get("input_guard", default_llm)))
+    graph.add_node("planner", make_planner_node(nlm.get("planner", default_llm)))
+    graph.add_node("search_subgraph", _run_search)
+    graph.add_node(
+        "react_researcher", make_react_researcher_node_from_llm(nlm.get("react_researcher", default_llm), mcp_tools)
+    )
+    graph.add_node("tools", ToolNode(mcp_tools))
+    graph.add_node("writer", make_writer_node(nlm.get("writer", default_llm)))
+    graph.add_node("reflection_subgraph", _make_run_reflection(nlm.get("reflection", default_llm)))
+    graph.add_node("output_guard", make_output_guard_node(nlm.get("output_guard", default_llm)))
+    graph.add_node("dead_letter", dead_letter_node)
+
+    # Edges
+    graph.add_edge(START, "input_guard")
+    graph.add_conditional_edges("input_guard", _input_guard_condition)
+    graph.add_conditional_edges("planner", _planner_condition)
+    graph.add_conditional_edges("search_subgraph", after("react_researcher"))
+    graph.add_conditional_edges("react_researcher", _react_condition)
+    graph.add_edge("tools", "react_researcher")
+    graph.add_conditional_edges("writer", after("reflection_subgraph"))
+    graph.add_conditional_edges("reflection_subgraph", after("output_guard"))
+    graph.add_edge("output_guard", END)
+    graph.add_edge("dead_letter", END)
+
     return graph
 
 
+def compile_simple_graph(checkpointer: AsyncPostgresSaver) -> CompiledStateGraph:
+    """Compile a minimal 2-node stub graph (no LLM, no interrupt) for infrastructure tests.
+
+    Used by Phase 1 checkpointing and time-travel tests to verify message accumulation
+    and checkpoint persistence without needing a real LLM or MCP server.
+    """
+    from langchain_core.messages import AIMessage
+
+    async def _stub_planner(state: AgentState, config: RunnableConfig) -> dict:
+        last = next((m for m in reversed(state["messages"]) if not isinstance(m, AIMessage)), None)
+        content = str(last.content) if last else ""
+        return {
+            "plan": [f"Research: {content}"],
+            "status": "searching",
+            "messages": [AIMessage(content=f"Plan: {content}")],
+        }
+
+    async def _stub_writer(state: AgentState, config: RunnableConfig) -> dict:
+        answer = f"Draft: {' | '.join(state.get('plan', []))}"  # type: ignore[arg-type]
+        return {
+            "draft_answer": answer,
+            "final_answer": answer,
+            "status": "done",
+            "messages": [AIMessage(content=answer)],
+        }
+
+    graph: StateGraph = StateGraph(AgentState)
+    graph.add_node("planner", _stub_planner)
+    graph.add_node("writer", _stub_writer)
+    graph.add_edge(START, "planner")
+    graph.add_edge("planner", "writer")
+    graph.add_edge("writer", END)
+    return graph.compile(checkpointer=checkpointer)
+
+
 def create_graph() -> StateGraph:
-    """Return the uncompiled StateGraph for LangGraph Studio."""
-    return _build_graph()
+    """Return the uncompiled StateGraph for LangGraph Studio.
+
+    Studio injects its own checkpointer and MCP client, so this builds
+    the graph with a default LLM and empty tool list.
+    """
+    return _build_graph(build_llm(), [])
 
 
-def compile_graph(checkpointer: AsyncPostgresSaver) -> CompiledStateGraph:
-    """Compile the graph with a Postgres checkpointer for production use."""
-    return _build_graph().compile(checkpointer=checkpointer)
+def compile_graph(
+    checkpointer: BaseCheckpointSaver,
+    mcp_tools: list[BaseTool],
+    node_llm_configs: dict[str, NodeLLMConfig] | None = None,
+) -> CompiledStateGraph:
+    """Compile the graph with a Postgres checkpointer for production use.
+
+    Builds one LLM per unique NodeLLMConfig entry; nodes absent from
+    node_llm_configs share the default LLM instance.
+
+    Args:
+        checkpointer: Async Postgres checkpointer from lifespan.
+        mcp_tools: MCP tools loaded from the tool server (via load_mcp_tools()).
+        node_llm_configs: Per-node LLM overrides keyed by node name.
+            Valid keys: input_guard, planner, react_researcher, writer,
+            output_guard, reflection.
+    """
+    default_llm = build_llm()
+    node_llms = {name: build_llm(cfg) for name, cfg in (node_llm_configs or {}).items()}
+    return _build_graph(default_llm, mcp_tools, node_llms).compile(checkpointer=checkpointer)

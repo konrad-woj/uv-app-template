@@ -4,6 +4,7 @@ from pydantic import BaseModel, field_validator
 class ChatRequest(BaseModel):
     thread_id: str
     message: str
+    approve: bool | None = None  # None = new turn; True/False = resume interrupt
 
     @field_validator("message")
     @classmethod

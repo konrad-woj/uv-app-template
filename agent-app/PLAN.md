@@ -507,6 +507,80 @@ Config: `AGENT_LLM_MODEL` (default `openai/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit`)
 
 Default model is [Unsloth Qwen3.6](https://unsloth.ai/docs/models/qwen3.6): MLX 4-bit variant running via Unsloth Studio on Apple Silicon. The `openai/` prefix tells LiteLLM to use the OpenAI-compatible endpoint.
 
+### Node-Level LLM Config
+
+Different nodes have different latency/quality trade-offs. Guards want a fast, cheap call; planners and critics benefit from thinking mode. `NodeLLMConfig` is a dataclass of optional overrides; any field left `None` falls back to the global `Settings` value. `build_llm(override)` is the single construction point — retry/timeout logic in `llm_invoke_with_retry` is unchanged.
+
+```python
+# nodes/_llm_invoke.py
+from dataclasses import dataclass
+
+@dataclass
+class NodeLLMConfig:
+    model: str | None = None
+    temperature: float | None = None
+    thinking: bool | None = None
+    timeout_seconds: float | None = None
+    max_retries: int | None = None
+
+def build_llm(override: NodeLLMConfig | None = None) -> ChatLiteLLM:
+    cfg = override or NodeLLMConfig()
+    return ChatLiteLLM(
+        model=cfg.model or settings.llm_model,
+        api_base=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        temperature=cfg.temperature,          # None → provider default
+        model_kwargs={"enable_thinking": cfg.thinking if cfg.thinking is not None else settings.llm_thinking},
+    )
+```
+
+`_build_graph` and `compile_graph` accept a `node_llm_configs: dict[str, NodeLLMConfig] | None` map. Nodes absent from the map receive the default LLM. LLM instances are deduplicated — nodes sharing the same resolved config reuse the same object.
+
+```python
+# workflow.py
+def _build_graph(
+    default_llm: BaseChatModel,
+    mcp_tools: list[BaseTool],
+    node_llms: dict[str, BaseChatModel] | None = None,
+) -> StateGraph:
+    nlm = node_llms or {}
+    graph.add_node("input_guard",  make_input_guard_node(nlm.get("input_guard", default_llm)))
+    graph.add_node("planner",      make_planner_node(nlm.get("planner", default_llm)))
+    graph.add_node("react_researcher", make_react_researcher_node_from_llm(nlm.get("react_researcher", default_llm), mcp_tools))
+    graph.add_node("writer",       make_writer_node(nlm.get("writer", default_llm)))
+    graph.add_node("output_guard", make_output_guard_node(nlm.get("output_guard", default_llm)))
+    # reflection subgraph receives its own LLM via build_reflection_subgraph(llm)
+    graph.add_node("reflection_subgraph", _make_run_reflection(nlm.get("reflection", default_llm)))
+    ...
+
+def compile_graph(
+    checkpointer: AsyncPostgresSaver,
+    mcp_tools: list[BaseTool],
+    node_llm_configs: dict[str, NodeLLMConfig] | None = None,
+) -> CompiledStateGraph:
+    default_llm = build_llm()
+    node_llms = {name: build_llm(cfg) for name, cfg in (node_llm_configs or {}).items()}
+    return _build_graph(default_llm, mcp_tools, node_llms).compile(checkpointer=checkpointer)
+```
+
+`main.py` lifespan passes the default node config map. Guards use the default (fast, no thinking); planner, react_researcher, writer, and reflection nodes enable thinking if `AGENT_LLM_THINKING=true`.
+
+```python
+# main.py lifespan — intent-declaring config map; adjust per deployment
+node_llm_configs = {
+    "planner":          NodeLLMConfig(thinking=True),
+    "react_researcher": NodeLLMConfig(thinking=True),
+    "writer":           NodeLLMConfig(thinking=True),
+    "reflection":       NodeLLMConfig(thinking=True),
+    # input_guard and output_guard: default (no thinking, faster)
+}
+app.state.graph = compile_graph(checkpointer, mcp_tools, node_llm_configs)
+```
+
+`llm_invoke_with_retry` reads `timeout_seconds` and `max_retries` from the LLM instance's metadata rather than directly from `settings`, so per-node overrides flow through automatically.
+
+**Valid node keys**: `input_guard`, `planner`, `react_researcher`, `writer`, `output_guard`, `reflection` (covers both critic and refiner inside the reflection subgraph — they share one LLM instance).
+
 ---
 
 ## Postgres Checkpointer
@@ -577,7 +651,7 @@ Config: `AGENT_MCP_SERVER_URL` (default `http://localhost:8001`).
 
 ---
 
-### Phase 2 — Interrupts + Subgraphs + Fan-out/Fan-in + ReAct + MCP + Guardrails + Reflection
+### Phase 2 — Interrupts + Subgraphs + Fan-out/Fan-in + ReAct + MCP + Guardrails + Reflection ✓ DONE
 
 **Deliverables**:
 - `nodes/_dead_letter.py` — `DeadLetterInfo` TypedDict, `with_dead_letter(node_name)` decorator, `dead_letter_node`, `after(next_node)` routing helper
@@ -591,7 +665,7 @@ Config: `AGENT_MCP_SERVER_URL` (default `http://localhost:8001`).
 - `mcp/server.py` — `fastmcp` server with `web_search` + `fetch_url` tools
 - `graph/mcp_client.py` — `MultiServerMCPClient` factory returning `BaseTool`-compatible list
 - `exceptions.py` — `LLMError`, `LLMRateLimitError`, `LLMServiceUnavailableError`, `LLMServiceError`
-- `graph/nodes/_llm_invoke.py` — centralized async LLM wrapper with error translation
+- `graph/nodes/_llm_invoke.py` — centralized async LLM wrapper with error translation; `NodeLLMConfig` dataclass; `build_llm(override)` merges node overrides onto global settings
 - Full graph wired in `workflow.py`
 - Resume logic in `routers.py`: `aget_state()` → check `snapshot.next` → `Command(resume=...)` vs fresh invoke
 - `models.py` — `ChatRequest`, `ChatResponse` with `is_interrupted: bool`, `interrupt_value: dict | None`, `guard_reason: str | None`
@@ -616,17 +690,347 @@ Config: `AGENT_MCP_SERVER_URL` (default `http://localhost:8001`).
 
 ### Phase 3 — Token Streaming (SSE)
 
+#### What Phase 3 is (and is not)
+
+**Completely additive**: Phase 3 adds one new endpoint — `POST /v1/chat/stream`. Every other
+file from Phase 2 is unchanged. The graph, nodes, subgraphs, models, checkpointer, and
+`POST /v1/chat` endpoint continue to work exactly as before. Streaming is a different
+*transport* for the same compiled graph, not a different graph.
+
+**What changes**:
+- `routers.py` — one new endpoint function `chat_stream` added below the existing `chat` endpoint.
+- No changes to `graph/`, `models.py`, `config.py`, `dependencies.py`, `main.py`, or any node.
+
+**What stays the same**:
+- `POST /v1/chat` remains the canonical non-streaming endpoint. Use it for non-browser clients,
+  programmatic polling, and interrupt resumes from clients that don't support SSE.
+- The graph itself doesn't know it is being streamed. `astream_events` is a wrapper on top of
+  `ainvoke` — same state transitions, same checkpoints, same interrupt mechanism.
+
+---
+
+#### How `astream_events` works
+
+`graph.astream_events(input, config, version="v2")` is an async generator that yields one dict
+per internal event. A single graph run produces many event types; only a subset matter for the
+streaming endpoint:
+
+| Event `event` field | `name` field | When emitted | What we do |
+|---|---|---|---|
+| `on_chat_model_stream` | `writer` | Each token chunk from the writer node | emit `event: token` frame |
+| `on_chain_end` | `LangGraph` | Graph reached END (or interrupt) | emit `event: done` or `event: interrupt` |
+| any | any | LLMError raised inside a node | emit `event: error` frame |
+
+The `version="v2"` argument is **required** — it enables the structured event schema. `v1` does
+not expose `on_chat_model_stream`.
+
+Each yielded dict has this structure:
+```python
+{
+    "event": "on_chat_model_stream",   # event type
+    "name": "ChatLiteLLM",            # model class name (NOT the node name)
+    "run_id": "uuid",
+    "tags": ["seq:step:4", "writer"], # tags include the LangGraph node name
+    "data": {
+        "chunk": AIMessageChunk(content="Hello")
+    },
+    "metadata": {...},
+}
+```
+
+**Filtering to the writer node only**: the `tags` list contains the node name as a plain string
+alongside LangGraph-internal tags. To avoid emitting tokens from `input_guard`, `planner`,
+`output_guard`, and the reflection critic/refiner (all of which also call the LLM), filter by
+both event type *and* the presence of `"writer"` in `event["tags"]`:
+
+```python
+if event["event"] == "on_chat_model_stream" and "writer" in event.get("tags", []):
+    chunk: AIMessageChunk = event["data"]["chunk"]
+    token = chunk.content
+    if token:
+        yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+```
+
+Without the tag filter, every guardrail LLM call would also stream tokens to the client — wrong.
+
+---
+
+#### SSE wire format
+
+Server-Sent Events is a plain-text HTTP protocol. Each frame is separated by a blank line.
+The `event:` line names the frame type; the `data:` line carries a JSON payload.
+
+```
+event: token
+data: {"token": "The"}
+
+event: token
+data: {"token": " research"}
+
+event: token
+data: {"token": " shows"}
+
+event: interrupt
+data: {"interrupt_value": {"plan": ["step 1", "step 2", "step 3"]}}
+
+event: done
+data: {"status": "done", "final_answer": "..."}
+
+event: error
+data: {"code": 429, "detail": "LLM rate limit exceeded"}
+```
+
+A frame with `event: done` or `event: error` is always the last frame. The client should close
+the connection after receiving either.
+
+---
+
+#### Interrupt handling in the stream
+
+When the planner calls `interrupt()`, `astream_events` stops yielding `on_chat_model_stream`
+events and the graph suspends. The suspension surfaces as the `on_chain_end` event for the
+top-level `"LangGraph"` chain with an interrupted state (the next checkpoint has `snapshot.next`
+non-empty).
+
+The endpoint detects this by checking state after the stream exhausts:
+
+```python
+async def _generate(graph, input_, config, request):
+    async for event in graph.astream_events(input_, config, version="v2"):
+        if await request.is_disconnected():
+            return
+
+        if event["event"] == "on_chat_model_stream" and "writer" in event.get("tags", []):
+            chunk = event["data"]["chunk"]
+            if chunk.content:
+                yield f"event: token\ndata: {json.dumps({'token': chunk.content})}\n\n"
+
+    # Stream exhausted — check final state.
+    snapshot = await graph.aget_state(config)
+    if bool(snapshot.next):
+        # Graph suspended at interrupt (planner waiting for approval).
+        interrupt_value = _extract_interrupt_value(snapshot)
+        yield f"event: interrupt\ndata: {json.dumps({'interrupt_value': interrupt_value})}\n\n"
+    else:
+        state = snapshot.values
+        yield f"event: done\ndata: {json.dumps({'status': state.get('status', 'done'), 'final_answer': state.get('final_answer')})}\n\n"
+```
+
+**Key point**: after receiving `event: interrupt`, the client calls `POST /v1/chat` (or
+`POST /v1/chat/stream`) with `approve: true` or `approve: false`. The stream endpoint accepts
+the same `ChatRequest` including the `approve` field — interrupt resume works identically to
+the non-streaming endpoint. There is no separate "resume stream" endpoint.
+
+---
+
+#### Error handling
+
+`astream_events` propagates exceptions from inside nodes. Wrap the generator loop in a
+`try/except`:
+
+```python
+async def _generate(graph, input_, config, request):
+    try:
+        async for event in graph.astream_events(input_, config, version="v2"):
+            ...
+    except LLMRateLimitError:
+        yield f"event: error\ndata: {json.dumps({'code': 429, 'detail': 'LLM rate limit exceeded'})}\n\n"
+    except LLMServiceUnavailableError:
+        yield f"event: error\ndata: {json.dumps({'code': 503, 'detail': 'LLM service unavailable'})}\n\n"
+    except Exception:
+        yield f"event: error\ndata: {json.dumps({'code': 500, 'detail': 'Internal server error'})}\n\n"
+```
+
+Note: because `with_dead_letter` catches all exceptions *inside* nodes and writes them to state
+instead of re-raising, the majority of node failures will **not** surface here — they'll produce
+an `event: done` frame with `status: "dead_lettered"`. The `except` block above catches only
+errors that escape `astream_events` entirely (e.g., checkpointer failure, graph compilation
+error).
+
+---
+
+#### Complete endpoint implementation (in `routers.py`)
+
+```python
+import json
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+
+@router.post("/v1/chat/stream", tags=["chat"])
+async def chat_stream(
+    request: Request,
+    body: ChatRequest,
+    graph: Annotated[CompiledStateGraph, Depends(get_graph)],
+) -> StreamingResponse:
+    """Token-streaming variant of POST /v1/chat.
+
+    Returns a text/event-stream response. Frames:
+      event: token       — one LLM token from the writer node
+      event: interrupt   — graph paused at planner interrupt
+      event: done        — graph reached END
+      event: error       — unhandled exception escaped the graph
+
+    Resume an interrupt: call this endpoint again with the same thread_id
+    and approve=true or approve=false in the request body. The stream
+    endpoint handles resume exactly like POST /v1/chat.
+    """
+    config: RunnableConfig = {
+        "configurable": {"thread_id": body.thread_id},
+        "recursion_limit": settings.max_pipeline_steps,
+    }
+
+    snapshot = await graph.aget_state(config)
+    is_interrupted = bool(snapshot.next) and snapshot.values
+
+    if is_interrupted and body.approve is None:
+        # Thread is paused but caller did not supply approve — surface the interrupt
+        # value immediately so the client knows it must respond, without invoking the
+        # graph.  Sending Command(resume=None) would silently abort the research
+        # because the planner evaluates `if not approved` and None is falsy.
+        interrupt_value = _extract_interrupt_value(snapshot)
+        return StreamingResponse(
+            _emit_interrupt(interrupt_value),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    if is_interrupted:
+        graph_input = Command(resume=body.approve)
+    else:
+        graph_input = {"messages": [HumanMessage(content=body.message)], "status": "planning"}
+
+    return StreamingResponse(
+        _generate(graph, graph_input, config, request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _generate(graph, graph_input, config, request: Request):
+    try:
+        async for event in graph.astream_events(graph_input, config, version="v2"):
+            if await request.is_disconnected():
+                return
+            if event["event"] == "on_chat_model_stream" and "writer" in event.get("tags", []):
+                token = event["data"]["chunk"].content
+                if token:
+                    yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+    except Exception as exc:
+        code, detail = _classify_error(exc)
+        yield f"event: error\ndata: {json.dumps({'code': code, 'detail': detail})}\n\n"
+        return
+
+    snapshot = await graph.aget_state(config)
+    if bool(snapshot.next):
+        interrupt_value = _extract_interrupt_value(snapshot)
+        yield f"event: interrupt\ndata: {json.dumps({'interrupt_value': interrupt_value})}\n\n"
+    else:
+        state = snapshot.values
+        yield f"event: done\ndata: {json.dumps({'status': state.get('status', 'done'), 'final_answer': state.get('final_answer')})}\n\n"
+```
+
+`X-Accel-Buffering: no` disables Nginx response buffering — required when running behind a
+reverse proxy, otherwise tokens are batched and delivered late.
+
+---
+
+#### What the caller must do
+
+**HTTP requirements**:
+- `Content-Type: application/json` on the request body (same as `POST /v1/chat`).
+- **Do not** set `Accept: application/json` — this is not JSON. No `Accept` header needed;
+  the server sets `Content-Type: text/event-stream`.
+- Keep the connection open until `event: done` or `event: error` arrives, then close.
+
+**curl (token-by-token output)**:
+```bash
+# New conversation
+curl -N -X POST http://localhost:8000/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"thread_id": "t1", "message": "Research quantum computing trends"}'
+
+# After receiving event: interrupt — approve the plan
+curl -N -X POST http://localhost:8000/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"thread_id": "t1", "message": "approve", "approve": true}'
+```
+
+`-N` disables curl's output buffering so tokens print immediately instead of after the
+connection closes.
+
+**Python (httpx)**:
+```python
+import httpx, json
+
+async with httpx.AsyncClient() as client:
+    async with client.stream(
+        "POST",
+        "http://localhost:8000/v1/chat/stream",
+        json={"thread_id": "t1", "message": "Research quantum computing trends"},
+        timeout=None,
+    ) as response:
+        async for line in response.aiter_lines():
+            if line.startswith("data:"):
+                payload = json.loads(line[5:].strip())
+                # handled by the preceding "event:" line type
+            elif line.startswith("event:"):
+                event_type = line[6:].strip()
+                if event_type in ("done", "error"):
+                    break  # last frame; close
+```
+
+**Browser (EventSource)**:
+`EventSource` only supports `GET` requests. For `POST`-based SSE you need `fetch`:
+
+```javascript
+const response = await fetch("/v1/chat/stream", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ thread_id: "t1", message: "Research quantum computing trends" }),
+});
+
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+  const frames = buffer.split("\n\n");
+  buffer = frames.pop();          // keep partial frame
+  for (const frame of frames) {
+    const lines = frame.trim().split("\n");
+    const eventType = lines.find(l => l.startsWith("event:"))?.slice(6).trim();
+    const data = JSON.parse(lines.find(l => l.startsWith("data:"))?.slice(5).trim() ?? "{}");
+    if (eventType === "token") appendToken(data.token);
+    if (eventType === "interrupt") showApprovalUI(data.interrupt_value);
+    if (eventType === "done") finalize(data.final_answer);
+    if (eventType === "error") showError(data);
+  }
+}
+```
+
+---
+
 **Deliverables**:
-- `POST /v1/chat/stream` — `StreamingResponse` with `text/event-stream`
-- Filter `astream_events(version="v2")` for `on_chat_model_stream` → `event: token`
-- Interrupt mid-stream → `event: interrupt` frame with `interrupt_value`
-- `LLMError` → `event: error` frame with status code
-- Client disconnect guard via `request.is_disconnected`
+- `routers.py` — `chat_stream` endpoint + `_generate` async generator + `_emit_interrupt` async generator + `_classify_error` + `_extract_interrupt_value` helpers
+- `graph/nodes/_llm_invoke.py` — add `streaming=True` to `build_llm()` so `astream_events` receives `on_chat_model_stream` chunks; safe for the non-streaming endpoint because `ainvoke` with streaming enabled still returns a complete aggregated message
 
-**Tests**:
-- `tests/test_routers.py` — token frames, interrupt frame, done frame, error frame on LLM failure
+**Tests** (`tests/test_routers.py`):
+- `test_stream_emits_token_frames` — mock writer LLM to return 3 chunks; assert 3 `event: token` frames arrive before `event: done`
+- `test_stream_interrupt_frame` — mock planner to interrupt; assert `event: interrupt` frame with `interrupt_value`
+- `test_stream_approve_none_on_interrupted_thread_emits_interrupt_frame` — thread is paused, POST without `approve`; assert single `event: interrupt` frame returned immediately, graph not invoked
+- `test_stream_resume_via_stream_endpoint` — after interrupt, POST with `approve=true`; assert tokens flow and `event: done` arrives
+- `test_stream_done_frame` — assert `event: done` carries `status` and `final_answer`
+- `test_stream_error_frame` — mock `astream_events` to raise `LLMRateLimitError`; assert `event: error` with `code: 429`
+- `test_stream_no_tokens_from_guard_nodes` — mock all LLM nodes; assert only writer tokens appear (tag filter works)
+- `test_stream_dead_lettered_arrives_as_done` — mock a node to raise inside `with_dead_letter`; assert `event: done` with `status: "dead_lettered"`, no `event: error`
+- `test_stream_disconnect` — simulate client disconnect mid-stream; assert generator stops cleanly
 
-**Done when**: `curl -N -X POST /v1/chat/stream` produces token-by-token SSE output.
+**Done when**: `curl -N -X POST /v1/chat/stream` produces token-by-token SSE output, an
+`event: interrupt` frame when the planner fires, and an `event: done` frame when the graph
+finishes. `POST /v1/chat` behaviour is unchanged and its tests still pass.
 
 ---
 
@@ -682,6 +1086,99 @@ Assertions are organised per-node so each node can be tested in isolation.
 - `tests/evals/test_trace_assertions.py` — each `trace_assertion` passes on a valid fixture and fails on a deliberately broken one
 
 **Done when**: `uv run task experiment` runs against a live server; both quality scores and trace assertion results appear in Langfuse at `http://localhost:3000`.
+
+---
+
+### Phase 5 — Security Hardening
+
+Addresses threats that arise when the app moves from local POC toward a shared or internet-facing deployment. Each item is independent and can be shipped incrementally; priority order matches risk severity.
+
+#### 5.1 — API Authentication
+
+All endpoints are currently unauthenticated. Any caller who can reach the port can invoke the full graph, consume LLM quota, and read checkpoint history for any thread.
+
+**Deliverables**:
+- `app/auth.py` — `APIKeyHeader` dependency that reads `X-API-Key` and validates against `AGENT_API_KEY` (loaded from env via `Settings`). Returns HTTP 401 on mismatch.
+- Apply the dependency globally via `app.include_router(router, dependencies=[Depends(verify_api_key)])` — one change point, covers all routes.
+- Exempt `/health` so liveness probes work without credentials.
+
+**Tests**:
+- `tests/test_auth.py` — missing key → 401, wrong key → 401, correct key → 200 on `/health`.
+
+#### 5.2 — Rate Limiting
+
+`POST /v1/chat` is expensive (LLM call + DB write per invocation). Without rate limiting a single client can exhaust the LLM token budget or flood the Postgres connection pool.
+
+**Deliverables**:
+- Add `slowapi` (ASGI-compatible, Redis-optional): `pip install slowapi`.
+- `app/rate_limit.py` — `Limiter` instance keyed on client IP; configurable via `AGENT_RATE_LIMIT` (e.g. `"20/minute"`).
+- Apply to `/v1/chat` and `/v1/threads/{thread_id}/replay` — the two endpoints that invoke the graph. `/health` and `/history` are exempt.
+- `429 Too Many Requests` response with `Retry-After` header.
+
+**Tests**:
+- `tests/test_rate_limit.py` — exceed limit → 429 with `Retry-After`; different IPs get independent counters.
+
+#### 5.3 — SSRF: DNS Rebinding & Hostname Resolution
+
+`_validate_url` in `mcp/server.py` checks URL strings before the HTTP request, which blocks obvious cases. It does **not** protect against DNS rebinding: a hostname like `attacker.com` could pass string validation but resolve to `127.0.0.1` at request time.
+
+**Deliverables**:
+- `app/mcp/ssrf.py` — `validate_url_and_host(url: str) -> str`:
+  1. Call existing `_validate_url` for scheme + literal-IP checks.
+  2. Resolve `parsed.hostname` via `socket.getaddrinfo` (async: `asyncio.get_event_loop().run_in_executor(None, ...)`) and re-validate every returned IP against the private-range blocklist.
+  3. Return the validated URL; raise `ValueError` on any violation.
+- Replace the `_validate_url` call in `fetch_url` with `validate_url_and_host`.
+- `max_results` in `web_search` capped at `AGENT_WEB_SEARCH_MAX_RESULTS` (default 10) to bound DuckDuckGo cost.
+
+**Tests**:
+- `tests/mcp/test_ssrf.py` — mock `getaddrinfo` to return a loopback IP for a legitimate-looking hostname → `ValueError`; public IP → passes.
+
+#### 5.4 — Request Size Limits & Input Bounds
+
+Unbounded inputs allow prompt-stuffing attacks (very long `message` fields that inflate LLM context and cost) and memory pressure from large request bodies.
+
+**Deliverables**:
+- `ChatRequest.message` — add `max_length=4096` Pydantic constraint. Messages beyond this are rejected at the boundary with HTTP 422 before any LLM is called.
+- `ChatRequest.thread_id` — add `max_length=128` constraint.
+- Uvicorn / FastAPI request body size limit: set `limit_concurrency` and add `app = FastAPI(..., max_request_size=65536)` or configure via reverse-proxy note in README.
+- `fetch_url.max_char` clamped server-side: `min(max_char, 8000)` to bound memory regardless of what the LLM requests.
+
+**Tests**:
+- `tests/test_models.py` — message over 4096 chars → `ValidationError`; thread_id over 128 chars → `ValidationError`.
+
+#### 5.5 — Prompt Injection Defence (Structured Prompts)
+
+The input guard classifies user intent but does not prevent a crafted user message from leaking into other nodes' system prompts. For example, a user message containing `\nIgnore previous instructions` is passed verbatim to the planner and writer.
+
+**Deliverables**:
+- `app/graph/nodes/_prompt_utils.py` — `sanitize_user_text(text: str) -> str`:
+  - Strip or escape common injection markers: leading/trailing XML-like tags (`<system>`, `</s>`), repeated newlines, null bytes.
+  - Apply in `input_guard`, `planner`, and `writer` where `last_human.content` is interpolated into prompts.
+- Planner and writer system prompts already use hard `"""` delimiters around user content; add explicit role labels (`User question:`, `---`) to structurally separate user content from system instructions.
+
+**Tests**:
+- `tests/graph/nodes/test_prompt_utils.py` — injection markers stripped; normal text passes through unchanged.
+
+#### 5.6 — Dependency Vulnerability Scanning
+
+No automated check currently flags known CVEs in the dependency tree.
+
+**Deliverables**:
+- Add `pip-audit` as a dev dependency: `uv add --dev pip-audit`.
+- `uv run task audit` → `pip-audit --require-hashes` (or without hashes for flexibility).
+- Add `audit` to the `precommit` task chain so CVE checks run on every pre-commit pass.
+- Pin all production dependencies to exact versions in `pyproject.toml` `[tool.uv.constraint]` or via `uv lock` (already done by default with `uv`).
+
+**Tests**:
+- No unit tests; CI gate: non-zero exit from `pip-audit` fails the build.
+
+---
+
+**Done when**:
+- Unauthenticated requests to `/v1/chat` return 401.
+- A DNS-rebinding mock test passes in `tests/mcp/test_ssrf.py`.
+- `uv run task audit` exits 0 on the current dependency set.
+- A message of 5000 characters is rejected with 422 before reaching any LLM node.
 
 ---
 

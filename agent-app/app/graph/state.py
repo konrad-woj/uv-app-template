@@ -20,13 +20,22 @@ from typing import Annotated, TypedDict
 
 from langchain_core.messages import AnyMessage
 
+from app.graph.nodes._dead_letter import DeadLetterInfo
+
 
 class AgentState(TypedDict):
     # operator.add reducer: nodes append to this list, never replace it.
     messages: Annotated[list[AnyMessage], operator.add]
     plan: list[str]  # planner output; each entry is one research step
+    plan_approved: bool
+    search_results: list[str]  # written once by search_subgraph after fan-in
+    react_steps: int  # incremented each ReAct iteration (observability)
     draft_answer: str  # writer output before reflection
+    reflection_attempts: int
+    reflection_passed: bool
     final_answer: str  # output_guard-approved answer returned to the caller
     # Lifecycle: "planning" → "searching" → "researching" → "writing" →
     #            "reflecting" → "done" | "aborted" | "blocked" | "dead_lettered"
     status: str
+    guard_reason: str | None  # set when input_guard or output_guard blocks
+    dead_letter: DeadLetterInfo | None  # set by with_dead_letter on unhandled exception

@@ -11,8 +11,19 @@ thread identity (and optionally a specific checkpoint) to the graph runtime:
 LangGraph persists a checkpoint after each node completes.  The checkpoint
 stores the full ``AgentState`` at that point in time, keyed by thread_id.  On
 the next ``ainvoke`` with the same thread_id, the graph loads the latest
-checkpoint and merges the new input into it — that is how multi-turn
-conversations accumulate messages without the client re-sending history.
+checkpoint and merges the new HumanMessage into the existing state — that is
+how multi-turn conversations accumulate messages without the client re-sending
+history.
+
+Interrupt / resume flow
+-----------------------
+When the planner calls interrupt(), the graph suspends and checkpoints. The
+``/v1/chat`` endpoint detects this via ``snapshot.next``:
+  - ``bool(snapshot.next)`` is True → graph is suspended at an interrupt.
+  - Response includes ``is_interrupted=True`` and ``interrupt_value`` with the plan.
+  - On the *next* call with the same thread_id and ``approve=True/False`` in the
+    request, the endpoint resumes with ``Command(resume=...)`` instead of a fresh
+    HumanMessage injection.
 
 Replay vs. fork
 ---------------
@@ -42,6 +53,7 @@ from fastapi import APIRouter, Depends
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 
 from app.config import settings
 from app.dependencies import get_graph
@@ -60,25 +72,71 @@ async def chat(
     request: ChatRequest,
     graph: Annotated[CompiledStateGraph, Depends(get_graph)],
 ) -> ChatResponse:
-    """Invoke the graph for a new turn in a conversation thread.
+    """Invoke the graph for a new turn or resume from an interrupt.
 
     On the first call for a thread_id, the graph starts from scratch.
-    On subsequent calls, LangGraph loads the latest checkpoint for that thread
-    and merges the new HumanMessage into the existing state — no client-side
-    history management needed.
+    On subsequent calls, LangGraph loads the latest checkpoint for that thread.
+
+    If the thread is suspended at an interrupt (planner waiting for approval),
+    the caller must include ``approve`` in the request. The endpoint then
+    resumes with Command(resume=True/False) instead of injecting a new message.
+
+    If not interrupted, the new HumanMessage is injected and the graph runs
+    forward.
     """
     config: RunnableConfig = {
         "configurable": {"thread_id": request.thread_id},
         "recursion_limit": settings.max_pipeline_steps,
     }
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content=request.message)], "status": "planning"},
-        config,
-    )
+
+    # Check if the thread is currently suspended at an interrupt.
+    snapshot = await graph.aget_state(config)
+    is_interrupted = bool(snapshot.next) and snapshot.values
+
+    if is_interrupted:
+        if request.approve is None:
+            # Thread is paused at an interrupt but caller didn't set approve.
+            # Re-read interrupt_value so the caller knows what they need to respond to.
+            interrupts = snapshot.tasks
+            interrupt_value = None
+            if interrupts:
+                first_task = interrupts[0]
+                raw = getattr(first_task, "interrupts", [None])[0]
+                if raw is not None:
+                    interrupt_value = raw.value if hasattr(raw, "value") else None
+            return ChatResponse(
+                thread_id=request.thread_id,
+                status="interrupted",
+                is_interrupted=True,
+                interrupt_value=interrupt_value,
+            )
+        result = await graph.ainvoke(Command(resume=request.approve), config)
+    else:
+        # Fresh turn: inject the new human message.
+        result = await graph.ainvoke(
+            {"messages": [HumanMessage(content=request.message)], "status": "planning"},
+            config,
+        )
+
+    # After invocation, check if the graph is now at a new interrupt.
+    post_snapshot = await graph.aget_state(config)
+    now_interrupted = bool(post_snapshot.next) and bool(post_snapshot.values)
+    interrupt_value = None
+    if now_interrupted:
+        interrupts = post_snapshot.tasks
+        if interrupts:
+            first_task = interrupts[0]
+            interrupt_value = getattr(first_task, "interrupts", [None])[0]
+            if interrupt_value is not None:
+                interrupt_value = interrupt_value.value if hasattr(interrupt_value, "value") else None
+
     return ChatResponse(
         thread_id=request.thread_id,
         status=result.get("status", "done"),
+        is_interrupted=now_interrupted,
+        interrupt_value=interrupt_value,
         final_answer=result.get("final_answer"),
+        guard_reason=result.get("guard_reason"),
     )
 
 
@@ -147,4 +205,5 @@ async def replay(
         thread_id=thread_id,
         status=result.get("status", "done"),
         final_answer=result.get("final_answer"),
+        guard_reason=result.get("guard_reason"),
     )

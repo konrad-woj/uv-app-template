@@ -10,9 +10,13 @@ Example .env:
     AGENT_LLM_THINKING=false
     AGENT_LLM_TIMEOUT_SECONDS=60
     AGENT_LLM_MAX_RETRIES=3
-    AGENT_MCP_SERVER_URL=http://localhost:8001
+    AGENT_MCP_SERVER_URL=http://localhost:8001/mcp
     AGENT_MAX_REFLECTION_ATTEMPTS=5
     AGENT_MAX_REACT_STEPS=10
+    AGENT_APP_HOST=0.0.0.0
+    AGENT_APP_PORT=8000
+    AGENT_MCP_HOST=0.0.0.0
+    AGENT_MCP_PORT=8001
     LOG_LEVEL=INFO
     LOG_ENV=production
 """
@@ -58,8 +62,8 @@ class Settings(BaseSettings):
         description="Maximum retries for transient LLM errors (rate limit, 5xx). Uses exponential backoff capped at 30s.",
     )
     mcp_server_url: str = Field(
-        default="http://localhost:8001",
-        description="URL of the fastmcp tool server.",
+        default="http://localhost:8001/mcp",
+        description="URL of the fastmcp tool server (streamable-http endpoint).",
     )
     max_reflection_attempts: int = Field(
         default=5,
@@ -77,6 +81,10 @@ class Settings(BaseSettings):
             "50 is generous for normal runs while still bounding runaway execution."
         ),
     )
+    app_host: str = Field(default="0.0.0.0", description="Bind host for the FastAPI app.")
+    app_port: int = Field(default=8000, description="Bind port for the FastAPI app.")
+    mcp_host: str = Field(default="0.0.0.0", description="Bind host for the MCP tool server.")
+    mcp_port: int = Field(default=8001, description="Bind port for the MCP tool server.")
 
 
 settings = Settings()

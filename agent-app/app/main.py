@@ -1,14 +1,17 @@
 """Agent App — FastAPI entry point.
 
 Lifecycle:
-  import   → configure_logging() called at module level.
-  startup  → create AsyncPostgresSaver, compile graph.
+  startup  → load MCP tools, create AsyncPostgresSaver, compile graph.
   shutdown → checkpointer connection pool is closed via async context manager.
 
 The compiled graph is stored on app.state.graph and injected into endpoints
 via the get_graph() dependency (app/dependencies.py).
 
 Quick start:
+    # terminal 1: MCP server
+    uv run python -m app.mcp.server
+
+    # terminal 2: FastAPI app
     uv run python -m app
     # → http://localhost:8000/docs
 """
@@ -22,6 +25,8 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from logger import configure_logging, get_logger
 
 from app.config import settings
+from app.graph.mcp_client import load_mcp_tools
+from app.graph.nodes._llm_invoke import NodeLLMConfig
 from app.graph.workflow import compile_graph
 from app.routers import router
 
@@ -38,9 +43,21 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     logger.info("Agent App starting")
 
+    mcp_tools = await load_mcp_tools(settings.mcp_server_url)
+    logger.info("MCP tools loaded", tool_count=len(mcp_tools))
+
+    node_llm_configs: dict[str, NodeLLMConfig] = {
+        "input_guard": NodeLLMConfig(temperature=0.0),
+        "planner": NodeLLMConfig(temperature=0.0),
+        "react_researcher": NodeLLMConfig(temperature=0.0),
+        "writer": NodeLLMConfig(temperature=0.3),
+        "reflection": NodeLLMConfig(temperature=0.2),
+        "output_guard": NodeLLMConfig(temperature=0.0),
+    }
+
     async with AsyncPostgresSaver.from_conn_string(settings.db_uri) as checkpointer:
         await checkpointer.setup()
-        app.state.graph = compile_graph(checkpointer)
+        app.state.graph = compile_graph(checkpointer, mcp_tools, node_llm_configs)
         logger.info("Graph compiled and ready")
         yield
 

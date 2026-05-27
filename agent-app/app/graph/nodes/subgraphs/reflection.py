@@ -1,0 +1,116 @@
+"""Reflection subgraph: critic/refiner loop with a hard attempt ceiling.
+
+Internal state keys (draft, passed) differ from AgentState (draft_answer,
+reflection_passed), so this subgraph must be invoked through a wrapper node
+in workflow.py that maps keys in both directions.
+
+Loop exit conditions (whichever comes first):
+  1. critic sets passed=True
+  2. reflection_attempts reaches MAX_REFLECTION_ATTEMPTS (settings.max_reflection_attempts)
+
+When the ceiling is hit, the best draft available is kept and reflection_passed
+propagates as False — the output guard still runs.
+
+Factory functions accept an LLM so tests can inject a mock.
+"""
+
+from collections.abc import Callable
+from typing import Literal, TypedDict
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel, ValidationError
+
+from app.config import settings
+from app.graph.nodes._llm_invoke import llm_invoke_with_retry
+
+_CRITIC_PROMPT = """You are a quality reviewer for research answers.
+Score the draft answer on: relevance, completeness, accuracy, and clarity.
+Determine if it is good enough to return to the user.
+
+Respond with JSON only:
+{"verdict": "pass" or "fail", "critique": "<one sentence explaining the main issue or confirming quality>"}"""
+
+_REFINER_PROMPT = """You are a research answer improver.
+Given the draft answer and critique, produce an improved version.
+Address the specific issues mentioned in the critique.
+Return only the improved answer text, no preamble."""
+
+
+class ReflectionState(TypedDict):
+    draft: str
+    critique: str
+    reflection_attempts: int
+    passed: bool
+
+
+class _CriticResponse(BaseModel):
+    verdict: str
+    critique: str
+
+
+def make_critic_node(llm: BaseChatModel) -> Callable:
+    """Return an async critic node bound to the given LLM."""
+
+    async def critic_node(state: ReflectionState, config: RunnableConfig) -> dict:
+        messages = [
+            SystemMessage(content=_CRITIC_PROMPT),
+            HumanMessage(content=f"Draft answer:\n{state['draft']}"),
+        ]
+        response = await llm_invoke_with_retry(llm, messages, config)
+        try:
+            parsed = _CriticResponse.model_validate_json(str(response.content))
+            passed = parsed.verdict == "pass"
+            critique = parsed.critique
+        except (ValidationError, ValueError):
+            passed = True  # parse failure → treat as pass to avoid infinite loop
+            critique = "Could not parse critic response."
+        return {
+            "critique": critique,
+            "passed": passed,
+            "reflection_attempts": state["reflection_attempts"] + 1,
+        }
+
+    return critic_node
+
+
+def make_refiner_node(llm: BaseChatModel) -> Callable:
+    """Return an async refiner node bound to the given LLM."""
+
+    async def refiner_node(state: ReflectionState, config: RunnableConfig) -> dict:
+        messages = [
+            SystemMessage(content=_REFINER_PROMPT),
+            HumanMessage(content=f"Draft:\n{state['draft']}\n\nCritique:\n{state['critique']}"),
+        ]
+        response = await llm_invoke_with_retry(llm, messages, config)
+        return {"draft": str(response.content)}
+
+    return refiner_node
+
+
+def should_refine(state: ReflectionState) -> Literal["refiner", "__end__"]:
+    ceiling_hit = state["reflection_attempts"] >= settings.max_reflection_attempts
+    return "__end__" if state["passed"] or ceiling_hit else "refiner"
+
+
+def build_reflection_subgraph(llm: BaseChatModel) -> CompiledStateGraph:
+    """Build and compile the reflection subgraph with the given LLM.
+
+    Args:
+        llm: LLM used for critic and refiner nodes.
+    """
+    graph: StateGraph = StateGraph(ReflectionState)
+    graph.add_node("critic", make_critic_node(llm))
+    graph.add_node("refiner", make_refiner_node(llm))
+    graph.add_edge(START, "critic")
+    graph.add_conditional_edges("critic", should_refine)
+    graph.add_edge("refiner", "critic")
+    return graph.compile()
+
+
+# Module-level stub for import compatibility; replaced at runtime by compile_graph()
+# which injects the real LLM.  Tests should call build_reflection_subgraph(mock_llm).
+reflection_subgraph: CompiledStateGraph | None = None

@@ -2,7 +2,7 @@ import uuid
 
 from langchain_core.messages import HumanMessage
 
-from app.graph.workflow import compile_graph
+from app.graph.workflow import compile_simple_graph
 from tests.conftest import langgraph_config
 
 
@@ -51,7 +51,7 @@ class TestTimeTravel:
         source=loop checkpoint where next=("planner",) replays the turn that
         originally produced that result.
         """
-        graph = compile_graph(async_checkpointer)
+        graph = compile_simple_graph(async_checkpointer)
         tid = f"test-replay-{uuid.uuid4()}"
 
         await graph.ainvoke({"messages": [HumanMessage("Hello!")], "status": "planning"}, langgraph_config(tid))
@@ -85,7 +85,7 @@ class TestTimeTravel:
         (before __start__ appends the new message) is the right fork point —
         the injected message becomes the first new message on the branch.
         """
-        graph = compile_graph(async_checkpointer)
+        graph = compile_simple_graph(async_checkpointer)
         tid = f"test-fork-{uuid.uuid4()}"
 
         await graph.ainvoke({"messages": [HumanMessage("Hello!")], "status": "planning"}, langgraph_config(tid))
@@ -114,7 +114,7 @@ class TestTimeTravel:
         aget_state_history returns checkpoints from every branch, so messages
         from the original turns are still visible after a fork is created.
         """
-        graph = compile_graph(async_checkpointer)
+        graph = compile_simple_graph(async_checkpointer)
         tid = f"test-fork-isolation-{uuid.uuid4()}"
 
         await graph.ainvoke({"messages": [HumanMessage("Hello!")], "status": "planning"}, langgraph_config(tid))

@@ -1,3 +1,5 @@
 import uvicorn
 
-uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False, log_level="info")
+from app.config import settings
+
+uvicorn.run("app.main:app", host=settings.app_host, port=settings.app_port, reload=False, log_level="info")
