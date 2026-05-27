@@ -1,7 +1,12 @@
-"""Writer node: drafts a final answer from accumulated research context.
+"""Writer node: drafts a final answer and extracts verifiable claims.
 
-Receives search_results (from search_subgraph) and messages (from react_researcher).
-Produces draft_answer, which flows into the reflection_subgraph for quality refinement.
+Receives the research context from react_researcher (via state["messages"]) and
+the research plan. Produces draft_answer (prose) and claims (list of specific
+verifiable facts), which flow into verify_subgraph and then reflection_subgraph.
+
+The LLM is prompted to return JSON with two keys: "answer" and "claims".
+On parse failure the raw content is used as draft_answer and claims is empty —
+verify_subgraph fans out to zero branches, which is valid.
 """
 
 from collections.abc import Callable
@@ -9,15 +14,33 @@ from collections.abc import Callable
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from logger import get_logger
+from pydantic import BaseModel, ValidationError
 
 from app.graph.nodes._dead_letter import with_dead_letter
 from app.graph.nodes._llm_invoke import llm_invoke_with_retry
 
-_SYSTEM_PROMPT = """You are a research writer. Given the user's research question,
-the research plan, and gathered search results, write a comprehensive, well-structured answer.
+logger = get_logger(__name__)
 
-Be specific, cite the information gathered, and ensure the answer directly addresses the question.
-Write in clear prose — no bullet points unless listing genuinely enumerable items."""
+_SYSTEM_PROMPT = """You are a research writer. Given the user's research question,
+the research plan, and the gathered research context, write a comprehensive, well-structured answer.
+
+Be specific and ensure the answer directly addresses the question.
+Write in clear prose — no bullet points unless listing genuinely enumerable items.
+
+Return a JSON object with exactly two keys:
+{
+  "answer": "<full research answer in prose>",
+  "claims": ["<specific verifiable factual claim>", ...]
+}
+
+List 3–5 specific factual claims made in the answer that can be independently verified
+(e.g. dates, statistics, names, events). Do not include opinions or methodology as claims."""
+
+
+class _WriterOutput(BaseModel):
+    answer: str
+    claims: list[str]
 
 
 def make_writer_node(llm: BaseChatModel) -> Callable:
@@ -30,15 +53,30 @@ def make_writer_node(llm: BaseChatModel) -> Callable:
             None,
         )
         question = str(last_human.content) if last_human else ""
-        search_summary = "\n".join(state.get("search_results", []))  # type: ignore[arg-type]
-        plan_summary = "\n".join(state.get("plan", []))  # type: ignore[arg-type]
-        context = f"Question: {question}\n\nPlan:\n{plan_summary}\n\nResearch:\n{search_summary}"
+        plan: list[str] = state.get("plan", [])  # type: ignore[assignment]
+        logger.info(
+            "writer.inputs",
+            question_length=len(question),
+            plan_step_count=len(plan),
+            message_count=len(state["messages"]),
+        )
+        plan_summary = "\n".join(plan)
+        context = f"Question: {question}\n\nResearch plan:\n{plan_summary}"
         messages = [
             SystemMessage(content=_SYSTEM_PROMPT),
             HumanMessage(content=context),
         ]
         response = await llm_invoke_with_retry(llm, messages, config)
-        draft = str(response.content)
-        return {"draft_answer": draft, "status": "reflecting"}
+        raw = str(response.content)
+        try:
+            parsed = _WriterOutput.model_validate_json(raw)
+            draft = parsed.answer
+            claims = parsed.claims
+        except (ValidationError, ValueError):
+            logger.warning("writer.parse_failed", raw_length=len(raw))
+            draft = raw
+            claims = []
+        logger.info("writer.draft_produced", draft_length=len(draft), claim_count=len(claims))
+        return {"draft_answer": draft, "claims": claims, "status": "writing"}
 
     return writer

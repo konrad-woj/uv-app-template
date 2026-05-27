@@ -16,12 +16,15 @@ from typing import TYPE_CHECKING
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
+from logger import get_logger
 
 from app.graph.nodes._dead_letter import with_dead_letter
 from app.graph.nodes._llm_invoke import llm_invoke_with_retry
 
 if TYPE_CHECKING:
     from app.graph.state import AgentState
+
+logger = get_logger(__name__)
 
 
 def make_react_researcher_node(llm_with_tools: BaseChatModel | Runnable) -> Callable:  # type: ignore[type-arg]
@@ -33,8 +36,16 @@ def make_react_researcher_node(llm_with_tools: BaseChatModel | Runnable) -> Call
 
     @with_dead_letter("react_researcher")
     async def react_researcher(state: "AgentState", config: RunnableConfig) -> dict:
+        step = state.get("react_steps", 0) + 1
+        logger.info(
+            "react_researcher.inputs",
+            step=step,
+            message_count=len(state["messages"]),
+        )
         response = await llm_invoke_with_retry(llm_with_tools, state["messages"], config)  # type: ignore[arg-type]
-        return {"messages": [response], "react_steps": state.get("react_steps", 0) + 1}
+        tool_calls = getattr(response, "tool_calls", None)
+        logger.info("react_researcher.response", step=step, tool_call_count=len(tool_calls) if tool_calls else 0)
+        return {"messages": [response], "react_steps": step}
 
     return react_researcher
 

@@ -17,12 +17,14 @@ Usage:
     graph.add_conditional_edges("my_node", after("next_node"))
 """
 
+import time
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypedDict
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphInterrupt
 from logger import get_logger
 
 if TYPE_CHECKING:
@@ -48,9 +50,31 @@ def with_dead_letter(node_name: str) -> Callable:
 
     def decorator(fn: Callable) -> Callable:
         async def wrapper(state: dict, config: RunnableConfig) -> dict:
+            thread_id = (config.get("configurable") or {}).get("thread_id")
+            t0 = time.perf_counter()
+            logger.info(
+                "node_start",
+                node=node_name,
+                thread_id=thread_id,
+                current_status=state.get("status"),
+                message_count=len(state.get("messages", [])),
+            )
             try:
-                return await fn(state, config)
+                result = await fn(state, config)
+                duration_ms = round((time.perf_counter() - t0) * 1000)
+                logger.info(
+                    "node_complete",
+                    node=node_name,
+                    thread_id=thread_id,
+                    duration_ms=duration_ms,
+                    new_status=result.get("status") if isinstance(result, dict) else None,
+                )
+                return result
+            except GraphInterrupt:
+                # LangGraph interrupt() signal — must propagate for the runtime to suspend the graph.
+                raise
             except Exception as exc:
+                duration_ms = round((time.perf_counter() - t0) * 1000)
                 info: DeadLetterInfo = {
                     "failed_node": node_name,
                     "error_type": type(exc).__name__,
@@ -61,6 +85,8 @@ def with_dead_letter(node_name: str) -> Callable:
                 logger.error(
                     "Node raised unhandled exception, routing to dead_letter",
                     node=node_name,
+                    thread_id=thread_id,
+                    duration_ms=duration_ms,
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )

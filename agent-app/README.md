@@ -14,9 +14,10 @@ Each node in the graph is a vehicle for exactly one LangGraph or agentic pattern
 | **Human-in-the-loop** | `planner` | `interrupt()` pauses graph; resumed with `Command(resume=True/False)` |
 | **Reflection** | `reflection_subgraph` | Critic → Refiner loop until quality criteria are met |
 | **MCP** | `react_researcher` (consumer) + `app/mcp/server.py` (server) | `fastmcp` exposes tools; `langchain-mcp-adapters` binds them to LangGraph |
-| **Guardrails** | `input_guard`, `output_guard` | LLM-based safety/relevance check at graph entry and exit |
+| **Guardrails** | `input_guard`, `resume_guard`, `output_guard` | Three-layer input check (regex → GLiGuard → LLM topic); resume message checked by dedicated node; two-layer output check (GLiGuard PII redaction → LLM grounding) |
 | **Dead letter** | `dead_letter` terminal node | Any unhandled node exception writes `DeadLetterInfo` to state and routes here instead of crashing |
 | **Time-travel** | `GET /v1/threads/{id}/history`, `POST /v1/threads/{id}/replay` | Postgres checkpointer stores every state snapshot; replay re-invokes from any checkpoint |
+| **Token streaming** | `POST /v1/chat/stream` | `astream_events` pipes writer-node tokens as SSE frames |
 
 ## Reliability safeguards
 
@@ -35,7 +36,7 @@ All limits are configurable via `AGENT_` env vars.
 - [Docker](https://docs.docker.com/get-docker/)
 - Python 3.13
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- LLM inference server (Phase 2+) — see [LLM setup](#2-llm-setup)
+- LLM inference server — see [LLM setup](#2-llm-setup)
 
 ## Local setup
 
@@ -77,31 +78,31 @@ hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF --include "*UD-Q4_K_XL*"
 # Port 8001 is reserved for the MCP server.
 ```
 
-### 3. MCP server (Phase 2+, separate terminal)
+### 3. MCP server (separate terminal)
 
 ```bash
 cd agent-app
-uv run python -m app.mcp.server   # serves on http://localhost:8001
+uv run task mcp   # serves on http://localhost:8001
 ```
 
 ### 4. App
 
 ```bash
 cd agent-app
-cp .env.example .env   # fill LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY for Phase 4
+cp .env.example .env   # fill in LANGFUSE_* keys for observability (optional)
 uv sync
 uv run python -m app
 # → http://localhost:8000/docs
 ```
 
-### 5. Langfuse (Phase 4, optional)
+### 5. Langfuse (optional — observability)
 
 ```bash
 git clone https://github.com/langfuse/langfuse.git
 cd langfuse
 docker compose up -d
 # UI at http://localhost:3000 — default login: admin@langfuse.com / password
-# Create a project and copy the keys to .env
+# Create a project and copy the keys to .env (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY)
 ```
 
 ### 6. LangGraph Studio
@@ -111,13 +112,14 @@ Open the `agent-app/` directory — Studio reads `langgraph.json` and starts a d
 
 ## Environment variables
 
-All variables use the `AGENT_` prefix. Defaults work for local development.
+All agent variables use the `AGENT_` prefix. Defaults work for local development.
 
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_DB_URI` | `postgresql://postgres:postgres@localhost:5433/langgraph` | Postgres connection string |
 | `AGENT_LLM_MODEL` | `openai/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit` | LiteLLM model identifier |
 | `AGENT_LLM_BASE_URL` | `http://127.0.0.1:8888/v1` | LLM provider base URL (Unsloth Studio) |
+| `AGENT_LLM_API_KEY` | `None` | API key for the LLM provider (any OpenAI-compatible backend) |
 | `AGENT_LLM_THINKING` | `false` | Enable Qwen3 chain-of-thought mode |
 | `AGENT_LLM_TIMEOUT_SECONDS` | `60` | Per-call LLM timeout in seconds |
 | `AGENT_LLM_MAX_RETRIES` | `3` | Retries for transient LLM errors (exponential backoff) |
@@ -125,20 +127,34 @@ All variables use the `AGENT_` prefix. Defaults work for local development.
 | `AGENT_MAX_REFLECTION_ATTEMPTS` | `5` | Hard ceiling on reflection critic/refiner iterations |
 | `AGENT_MAX_REACT_STEPS` | `10` | Hard ceiling on ReAct tool-call iterations |
 | `AGENT_MAX_PIPELINE_STEPS` | `50` | LangGraph `recursion_limit`: total supersteps across the whole pipeline per invocation |
+| `AGENT_GUARD_MODEL` | `fastino/gliguard-LLMGuardrails-300M` | HuggingFace model for GLiGuard (prompt injection, jailbreak, PII) |
+| `AGENT_GUARD_DEVICE` | `cpu` | Inference device for GLiGuard: `cpu`, `cuda`, or `mps` |
 | `AGENT_APP_HOST` | `0.0.0.0` | Bind host for the FastAPI app |
 | `AGENT_APP_PORT` | `8000` | Bind port for the FastAPI app |
 | `AGENT_MCP_HOST` | `0.0.0.0` | Bind host for the MCP tool server |
 | `AGENT_MCP_PORT` | `8001` | Bind port for the MCP tool server |
-| `AGENT_LOG_LEVEL` | `INFO` | Logging verbosity (consumed by the `logger` package): DEBUG, INFO, WARNING, ERROR |
+| `LANGFUSE_PUBLIC_KEY` | — | Langfuse project public key (observability) |
+| `LANGFUSE_SECRET_KEY` | — | Langfuse project secret key (observability) |
+| `LANGFUSE_BASE_URL` | `http://localhost:3000` | Langfuse server URL |
 
 ## API
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness probe |
-| `POST` | `/v1/chat` | Invoke the agent (first turn or interrupt resume) |
+| `POST` | `/v1/chat` | Invoke the agent (first turn or interrupt resume); returns full response |
+| `POST` | `/v1/chat/stream` | Same as `/v1/chat` but streams writer tokens as SSE |
 | `GET` | `/v1/threads/{id}/history` | Full checkpoint list for a thread (time-travel) |
 | `POST` | `/v1/threads/{id}/replay` | Re-invoke from a named checkpoint |
+
+### SSE event types (`POST /v1/chat/stream`)
+
+| Event | Payload | When |
+|---|---|---|
+| `token` | `{"token": "..."}` | Each writer-node LLM token |
+| `interrupt` | `{"interrupt_value": {...}}` | Graph paused at planner human-in-the-loop |
+| `done` | `{"status": "...", "final_answer": "..."}` | Graph reached END |
+| `error` | `{"code": 4xx/5xx, "detail": "..."}` | Unhandled exception escaped the graph |
 
 ### Example
 
@@ -153,6 +169,11 @@ curl -s -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"thread_id": "session-1", "message": "approve", "approve": true}' | jq
 
+# Stream writer tokens as SSE
+curl -s -N -X POST http://localhost:8000/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"thread_id": "session-2", "message": "Research recent advances in LLM agents"}'
+
 # Retrieve checkpoint history
 curl -s http://localhost:8000/v1/threads/session-1/history | jq
 
@@ -160,7 +181,6 @@ curl -s http://localhost:8000/v1/threads/session-1/history | jq
 curl -s -X POST http://localhost:8000/v1/threads/session-1/replay \
   -H "Content-Type: application/json" \
   -d '{"checkpoint_id": "<id_from_history>"}' | jq
-
 ```
 
 ## Tests
@@ -177,15 +197,18 @@ uv run task test-cov
 # Models only — no Postgres needed
 uv run pytest tests/test_models.py
 
+# API routes
+uv run pytest tests/test_routers.py
+
 # Graph checkpointing and time-travel
 uv run pytest tests/graph/
+
+# Individual node tests (includes resume_guard, prompt_utils, writer)
+uv run pytest tests/graph/nodes/
+
+# GLiGuard and guard utilities
+uv run pytest tests/guards/
+
+# MCP server tools
+uv run pytest tests/mcp/
 ```
-
-## Evals (Phase 4)
-
-```bash
-uv run task create-dataset   # upload sample.yaml to Langfuse
-uv run task experiment       # run eval suite, write results to evals/.runs/
-```
-
-Results appear in the Langfuse UI at http://localhost:3000.

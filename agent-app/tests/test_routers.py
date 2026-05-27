@@ -31,6 +31,7 @@ def mock_graph() -> MagicMock:
     g = MagicMock()
     g.aget_state = AsyncMock()
     g.ainvoke = AsyncMock()
+    g.aupdate_state = AsyncMock()
     return g
 
 
@@ -149,6 +150,17 @@ class TestChatFreshTurn:
         response = await client.post("/v1/chat", json={"thread_id": "t-4", "message": "hello"})
 
         assert response.json()["status"] == "done"
+
+    async def test_dead_letter_info_surfaced_in_chat_response(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        dead_letter_info = {"failed_node": "input_guard", "error_type": "RuntimeError", "error_message": "boom"}
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot())
+        mock_graph.ainvoke = AsyncMock(return_value={"status": "dead_lettered", "dead_letter": dead_letter_info})
+
+        response = await client.post("/v1/chat", json={"thread_id": "t-dl", "message": "hello"})
+
+        data = response.json()
+        assert data["status"] == "dead_lettered"
+        assert data["dead_letter"] == dead_letter_info
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +335,28 @@ class TestReplay:
     async def test_missing_checkpoint_id_returns_422(self, client: AsyncClient) -> None:
         response = await client.post("/v1/threads/t-1/replay", json={})
         assert response.status_code == 422
+
+    async def test_blank_checkpoint_id_returns_422(self, client: AsyncClient) -> None:
+        response = await client.post("/v1/threads/t-1/replay", json={"checkpoint_id": "   "})
+        assert response.status_code == 422
+
+    async def test_invalid_checkpoint_id_returns_404(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        mock_graph.ainvoke = AsyncMock(side_effect=Exception("invalid UUID"))
+
+        response = await client.post("/v1/threads/t-1/replay", json={"checkpoint_id": "not-a-uuid"})
+
+        assert response.status_code == 404
+        assert "not-a-uuid" in response.json()["detail"]
+
+    async def test_dead_letter_info_surfaced_in_response(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        dead_letter_info = {"failed_node": "input_guard", "error_type": "RuntimeError", "error_message": "boom"}
+        mock_graph.ainvoke = AsyncMock(return_value={"status": "dead_lettered", "dead_letter": dead_letter_info})
+
+        response = await client.post("/v1/threads/t-1/replay", json={"checkpoint_id": "cp-1"})
+
+        data = response.json()
+        assert data["status"] == "dead_lettered"
+        assert data["dead_letter"] == dead_letter_info
 
 
 # ---------------------------------------------------------------------------
@@ -532,11 +566,12 @@ class TestChatStream:
         assert len(token_frames) == 1
         assert token_frames[0]["data"]["token"] == "Final answer"
 
-    async def test_stream_dead_lettered_arrives_as_done(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+    async def test_stream_dead_lettered_arrives_as_error(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        dead_letter_info = {"failed_node": "input_guard", "error_type": "RuntimeError", "error_message": "boom"}
         mock_graph.aget_state = AsyncMock(
             side_effect=[
                 _snapshot(),
-                _snapshot(values={"status": "dead_lettered", "final_answer": None}),
+                _snapshot(values={"status": "dead_lettered", "dead_letter": dead_letter_info}),
             ]
         )
         mock_graph.astream_events = MagicMock(return_value=_astream())
@@ -545,8 +580,9 @@ class TestChatStream:
 
         frames = _parse_sse(response.text)
         assert len(frames) == 1
-        assert frames[0]["event"] == "done"
+        assert frames[0]["event"] == "error"
         assert frames[0]["data"]["status"] == "dead_lettered"
+        assert frames[0]["data"]["dead_letter"] == dead_letter_info
 
     async def test_stream_disconnect_stops_generator(self) -> None:
         mock_graph = MagicMock()

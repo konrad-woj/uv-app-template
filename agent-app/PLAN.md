@@ -1,5 +1,55 @@
 # Plan: agent-app — LangGraph + FastAPI + Postgres Reference Implementation
 
+## Table of Contents
+
+- [Context](#context)
+- [Patterns Demonstrated](#patterns-demonstrated)
+- [Target Layout](#target-layout)
+- [Graph Design](#graph-design)
+- [Pattern Deep-Dives](#pattern-deep-dives)
+  - [Fan-out / Fan-in](#fan-out--fan-in-inside-verify_subgraph)
+  - [ReAct — Non-deterministic Steps](#react--non-deterministic-steps-in-react_researcher)
+  - [Reflection](#reflection-inside-reflection_subgraph)
+  - [MCP — fastmcp Server + LangGraph Binding](#mcp--fastmcp-server--langgraph-binding)
+  - [Dead Letter State](#dead-letter-state)
+  - [Circuit Breakers & Loop Guards](#circuit-breakers--loop-guards)
+  - [Guardrails — Input, Resume, and Output](#guardrails--input-resume-and-output)
+- [LLM Client (LiteLLM + Unsloth / llama.cpp)](#llm-client-litellm--unsloth--llamacpp)
+  - [Node-Level LLM Config](#node-level-llm-config)
+- [Postgres Checkpointer](#postgres-checkpointer)
+- [MCP Server Startup](#mcp-server-startup)
+- [Key API Endpoints](#key-api-endpoints)
+- [Phases](#phases)
+  - [Phase 1 — Scaffold + Postgres + Basic Graph + Time-Travel](#phase-1--scaffold--postgres--basic-graph--time-travel)
+  - [Phase 2 — Interrupts + Subgraphs + Fan-out/Fan-in + ReAct + MCP + Guardrails + Reflection](#phase-2--interrupts--subgraphs--fan-outfan-in--react--mcp--guardrails--reflection--done)
+  - [Phase 3 — Token Streaming (SSE)](#phase-3--token-streaming-sse--done)
+    - [What Phase 3 is (and is not)](#what-phase-3-is-and-is-not)
+    - [How astream_events works](#how-astream_events-works)
+    - [SSE wire format](#sse-wire-format)
+    - [Interrupt handling in the stream](#interrupt-handling-in-the-stream)
+    - [Error handling](#error-handling)
+    - [Complete endpoint implementation](#complete-endpoint-implementation-in-routerspy)
+    - [What the caller must do](#what-the-caller-must-do)
+    - [SSE keepalive](#sse-keepalive-not-implemented-in-phase-3--see-note-below)
+  - [Phase 4 — Security Hardening ✓ 4.1–4.3, 4.5–4.6 DONE](#phase-4--security-hardening)
+    - [4.1 — API Authentication](#41--api-authentication)
+    - [4.2 — Rate Limiting](#42--rate-limiting)
+    - [4.3 — SSRF: DNS Rebinding & Hostname Resolution](#43--ssrf-dns-rebinding--hostname-resolution)
+    - [4.4 — Request Size Limits & Input Bounds](#44--request-size-limits--input-bounds)
+    - [4.5 — Guardrail Upgrade: Three-Layer Input Guard ✓ DONE](#45--guardrail-upgrade-three-layer-input-guard)
+    - [4.6 — Guardrail Upgrade: Output Guard PII Redaction ✓ DONE](#46--guardrail-upgrade-output-guard-pii-redaction)
+    - [4.7 — Dependency Vulnerability Scanning](#47--dependency-vulnerability-scanning)
+    - [4.8 — SSE Keepalive](#48--sse-keepalive)
+  - [Phase 5 — Evals (Langfuse + local HTTP runner)](#phase-5--evals-langfuse--local-http-runner)
+- [Dependencies](#dependencies)
+- [README.md Guide Sections](#readmemd-guide-sections)
+- [LangGraph Studio Config](#langgraph-studio-config-langgraphjson)
+- [Reuse from agent-lib](#reuse-from-agent-lib)
+- [Verification Per Phase](#verification-per-phase)
+- [Notes](#notes)
+
+---
+
 ## Context
 
 `agent-lib` already has a skeleton with Postgres checkpointing and time-travel tests. The goal is to create `agent-app/` as a best-practice, educational FastAPI service that sits alongside `churn-app/` and shows the full LangGraph feature set: time-travel, interrupts, async nodes, subgraphs, and SSE token streaming. LiteLLM + Ollama is the default LLM backend. The project informs structural patterns only (node factories, interrupt/resume flow, eval framework shape) — all business logic is original.
@@ -16,12 +66,12 @@ Each node in the graph demonstrates exactly one pattern:
 
 | Pattern | Where demonstrated | Key mechanism |
 |---|---|---|
-| **Subgraph** | `search_subgraph`, `reflection_subgraph` | Compiled `StateGraph` added as a single node |
-| **Fan-out / Fan-in** | Inside `search_subgraph` | `Send` API spawns parallel searchers; `operator.add` reducer collects results |
+| **Subgraph** | `verify_subgraph`, `reflection_subgraph` | Compiled `StateGraph` added as a single node |
+| **Fan-out / Fan-in** | Inside `verify_subgraph` | `Send` API spawns one verifier branch per claim; each branch does tool call + LLM verify; `operator.add` reducer fans results back in |
 | **ReAct (non-deterministic steps)** | `react_researcher` node | Model ↔ `ToolNode` loop; `tools_condition` edge exits when model emits no `tool_calls` |
 | **Reflection** | `reflection_subgraph` | Draft → Critic → Refiner → Critic loop until quality criteria met |
-| **MCP** | `react_researcher` (consumes) + `app/mcp/server.py` (serves) | `fastmcp` server exposes search/fetch tools; LangGraph agent binds them via `langchain-mcp-adapters` |
-| **Guardrails** | `input_guard` (pre-planner), `output_guard` (pre-END) | LLM-based safety/relevance check; routes to `END` with error on failure |
+| **MCP** | `react_researcher` (consumes) + `app/mcp/server.py` (serves) | `fastmcp` server exposes `web_search`, `fetch_url`, `fact_check` tools; LangGraph agent binds them via `langchain-mcp-adapters` |
+| **Guardrails** | `input_guard` (pre-planner), `resume_guard` (post-interrupt), `output_guard` (pre-END) | Three-layer input check (regex → GLiGuard → LLM topic); two-layer output check (GLiGuard PII redaction → deterministic verification check); resume message checked by dedicated node |
 | **Dead Letter** | `dead_letter` terminal node + `with_dead_letter` decorator | Any unhandled exception in any node writes `DeadLetterInfo` to state and routes to `dead_letter` instead of crashing |
 
 ---
@@ -55,7 +105,7 @@ agent-app/
     ├── mcp/
     │   ├── __init__.py
     │   ├── __main__.py        # uv run python -m app.mcp → uvicorn app.mcp.server:mcp
-    │   └── server.py          # fastmcp server exposing web_search + fetch_url tools
+    │   └── server.py          # fastmcp server exposing web_search, fetch_url, fact_check tools
     └── graph/
         ├── __init__.py
         ├── state.py           # AgentState TypedDict
@@ -65,13 +115,14 @@ agent-app/
             ├── __init__.py
             ├── _llm_invoke.py         # Centralised async LLM wrapper + error translation + build_llm() factory
             ├── _dead_letter.py        # DeadLetterInfo TypedDict + with_dead_letter decorator + dead_letter_node
-            ├── input_guard.py         # GUARDRAIL: blocks off-topic / unsafe input
-            ├── planner.py             # Plans steps; interrupt() for human approval
+            ├── input_guard.py         # GUARDRAIL: regex → GLiGuard → LLM topic check
+            ├── planner.py             # Plans steps; guards plan; interrupt() for human approval
+            ├── resume_guard.py        # GUARDRAIL: guards resume message (regex → GLiGuard only)
             ├── react_researcher.py    # ReAct: model ↔ ToolNode loop (MCP tools)
-            ├── writer.py              # Drafts final answer; streams tokens
-            ├── output_guard.py        # GUARDRAIL: validates answer before returning
+            ├── writer.py              # Drafts final answer + extracts verifiable claims
+            ├── output_guard.py        # GUARDRAIL: GLiGuard PII redaction → deterministic verification check
             └── subgraphs/
-                ├── search.py          # SUBGRAPH + FAN-OUT/FAN-IN: parallel searchers via Send
+                ├── verification.py    # SUBGRAPH + FAN-OUT/FAN-IN: parallel claim verifiers via Send
                 └── reflection.py      # SUBGRAPH + REFLECTION: critic/refiner loop
 ```
 
@@ -81,40 +132,46 @@ agent-app/
 
 ```mermaid
 flowchart TD
-    DL([END: dead_lettered]):::dl
+    classDef dl fill:#c0392b,color:#fff
+    classDef guard fill:#1a5276,color:#fff
 
     START([START]) --> input_guard
 
-    input_guard["input_guard\n— GUARDRAIL —\nLLM safety & topic check"]
+    input_guard["input_guard\n— GUARDRAIL —\n① Regex  ② GLiGuard  ③ LLM topic check"]:::guard
     input_guard -->|safe| planner
-    input_guard -->|unsafe / off-topic| END_blocked([END: blocked])
+    input_guard -->|blocked| END_blocked([END: blocked])
     input_guard -->|exception| dead_letter
 
-    planner["planner\n— INTERRUPT —\nGenerates research plan,\npauses for human approval"]
-    planner -->|approved| search_subgraph
-    planner -->|rejected| END_aborted([END: aborted])
+    planner["planner\n— INTERRUPT —\nGenerates plan, guards plan text\nif safe → interrupt(plan)\nresumes with approve / reject"]
+    planner -->|approved| resume_guard
+    planner -->|rejected or plan blocked| END_blocked
     planner -->|exception| dead_letter
 
-    subgraph search_subgraph["search_subgraph  — SUBGRAPH + FAN-OUT/FAN-IN —"]
-        direction LR
-        router["router\nfan-out via Send API"] --> s1["searcher 1"]
-        router --> s2["searcher 2"]
-        router --> sN["searcher N"]
-        s1 & s2 & sN -->|"operator.add (fan-in)"| agg["aggregate\nsearch_results"]
-    end
-
-    search_subgraph -->|ok| react_researcher
-    search_subgraph -->|exception| dead_letter
+    resume_guard["resume_guard\n— GUARDRAIL —\n① Regex  ② GLiGuard only"]:::guard
+    resume_guard -->|safe| react_researcher
+    resume_guard -->|blocked| END_blocked
+    resume_guard -->|exception| dead_letter
 
     react_researcher["react_researcher\n— ReAct + MCP —\nmodel ↔ ToolNode loop\nexits when no tool_calls"]
-    react_researcher -->|tool_calls| tools["ToolNode\n(MCP tools:\nweb_search, fetch_url)"]
+    react_researcher -->|tool_calls| tools["ToolNode\n(MCP: web_search, fetch_url, fact_check)"]
     tools --> react_researcher
     react_researcher -->|no tool_calls| writer
     react_researcher -->|exception| dead_letter
 
-    writer["writer\n— SSE STREAMING —\nDrafts answer,\nstreams tokens"]
-    writer -->|ok| reflection_subgraph
+    writer["writer\n— SSE STREAMING —\nDrafts answer + extracts claims"]
+    writer -->|ok| verify_subgraph
     writer -->|exception| dead_letter
+
+    subgraph verify_subgraph["verify_subgraph  — SUBGRAPH + FAN-OUT/FAN-IN —"]
+        direction LR
+        vg_router["router\nfan-out via Send API"] --> v1["verifier 1\n① fact_check tool\n② LLM verdict"]
+        vg_router --> v2["verifier 2\n① fact_check tool\n② LLM verdict"]
+        vg_router --> vN["verifier N\n① fact_check tool\n② LLM verdict"]
+        v1 & v2 & vN -->|"operator.add (fan-in)"| agg["aggregate\nverification_results"]
+    end
+
+    verify_subgraph -->|ok| reflection_subgraph
+    verify_subgraph -->|exception| dead_letter
 
     subgraph reflection_subgraph["reflection_subgraph  — SUBGRAPH + REFLECTION —"]
         direction LR
@@ -126,39 +183,38 @@ flowchart TD
     reflection_subgraph -->|ok| output_guard
     reflection_subgraph -->|exception| dead_letter
 
-    output_guard["output_guard\n— GUARDRAIL —\nLLM safety & grounding check"]
+    output_guard["output_guard\n— GUARDRAIL —\n① GLiGuard → PII redaction\n② deterministic verification check"]:::guard
     output_guard -->|safe| END_done([END: done])
-    output_guard -->|unsafe / low-quality| END_out_blocked([END: blocked\nwith safe fallback])
+    output_guard -->|blocked| END_blocked
     output_guard -->|exception| dead_letter
 
-    dead_letter["dead_letter\n— DEAD LETTER —\nLogs + persists DeadLetterInfo,\nsets status=dead_lettered"]
-    dead_letter --> DL
-
-    classDef dl fill:#c0392b,color:#fff
+    dead_letter["dead_letter\n— DEAD LETTER —\nLogs unhandled exceptions"]
+    dead_letter --> DL([END: dead_lettered]):::dl
 ```
 
 **State (`AgentState`)**:
 ```python
 class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
-    plan: list[str]                # Planner output
+    plan: list[str]                     # Planner output
     plan_approved: bool
-    search_results: list[str]      # written once by search_subgraph; fan-in is internal to the subgraph
-    react_steps: int               # incremented each ReAct iteration (observability only)
-    draft_answer: str              # writer output before reflection
-    reflection_attempts: int       # reflection loop counter
+    claims: list[str]                   # verifiable factual claims extracted by writer
+    verification_results: list[dict]    # per-claim results from verify_subgraph
+    react_steps: int                    # incremented each ReAct iteration (observability only)
+    draft_answer: str                   # writer output before reflection
+    reflection_attempts: int            # reflection loop counter
     reflection_passed: bool
-    final_answer: str              # output_guard-approved answer
-    status: str                    # "planning"|"searching"|"researching"|"writing"|"reflecting"|"done"|"aborted"|"blocked"|"dead_lettered"
-    guard_reason: str | None       # set when input_guard or output_guard blocks
+    final_answer: str                   # output_guard-approved answer
+    status: str                         # "planning"|"researching"|"writing"|"verifying"|"reflecting"|"done"|"aborted"|"blocked"|"dead_lettered"
+    guard_reason: str | None            # set when input_guard or output_guard blocks
     dead_letter: DeadLetterInfo | None  # set by with_dead_letter decorator on any unhandled exception
 ```
 
 **Key patterns**:
 - All nodes: `async def node(state: AgentState, config: RunnableConfig) -> dict`
 - Factory pattern: `make_planner_node(llm)` returns the async function
-- Interrupt: `planner` calls `interrupt({"plan": plan_text})`, resumed with `Command(resume=True/False)`
-- Subgraphs: `search_subgraph` and `reflection_subgraph` are compiled `StateGraph` instances added via `graph.add_node("search", search_subgraph)`
+- Interrupt: `planner` guards plan text then calls `interrupt({"plan": plan_text})`; resumed with `Command(resume=True/False)`; router adds resume message to state before resuming so `resume_guard` can inspect it
+- Subgraphs: `verify_subgraph` and `reflection_subgraph` are compiled `StateGraph` instances wrapped by mapper nodes in `workflow.py`
 - Token streaming: `graph.astream_events(input, config, version="v2")` filtered to `on_chat_model_stream`
 - All LangGraph invocations are async: `await graph.ainvoke(...)`, `await graph.aget_state(...)`, `await graph.aupdate_state(...)`
 - `snapshot.next` is `tuple[str, ...]` (not a list) — use `bool(snapshot.next)` to test if graph is interrupted
@@ -168,36 +224,52 @@ class AgentState(TypedDict):
 
 ## Pattern Deep-Dives
 
-### Fan-out / Fan-in (inside `search_subgraph`)
+### Fan-out / Fan-in (inside `verify_subgraph`)
 
-`search_subgraph` receives `plan` and fans out one searcher per plan step using the `Send` API.
-The `operator.add` reducer lives on `SearchState.results` *inside the subgraph* — the parallel
-`Send` branches each write one result and LangGraph merges them via the reducer before the
-subgraph exits. The parent `AgentState.search_results` is a plain `list[str]` written once
-when the subgraph returns.
+`verify_subgraph` receives `claims` extracted by the writer and fans out one verifier branch per
+claim using the `Send` API. Each branch is genuinely multi-step — tool call + LLM reasoning —
+which justifies Send over `ToolNode` (which can parallelize tool calls but cannot model
+in-branch LLM reasoning). The `operator.add` reducer lives on `VerificationState.results`
+*inside the subgraph*; each branch writes one structured result dict and LangGraph merges them
+before the subgraph exits.
 
 ```python
-# subgraphs/search.py
-class SearchState(TypedDict):
-    queries: list[str]
-    results: Annotated[list[str], operator.add]  # fan-in target — internal to subgraph
+# subgraphs/verification.py
+class VerificationState(TypedDict):
+    claims: list[str]                              # fan-out source
+    claim: str                                     # per-branch, injected by Send
+    results: Annotated[list[dict], operator.add]   # fan-in target — internal to subgraph
 
-def route_to_searchers(state: SearchState) -> list[Send]:
-    return [Send("searcher", {"queries": [], "results": [], "query": q})
-            for q in state["queries"]]
+def route_to_verifiers(state: VerificationState) -> list[Send]:
+    return [Send("verifier", {"claims": [], "claim": c, "results": []})
+            for c in state["claims"]]
 
-async def searcher_node(state: SearchState, config: RunnableConfig) -> dict:
-    result = await _run_search(state["query"], config)   # MCP web_search or DuckDuckGo
-    return {"results": [result]}
+def make_verifier_node(llm, fact_check_tool):
+    async def verifier_node(state: VerificationState, config: RunnableConfig) -> dict:
+        claim = state["claim"]
+        # Step 1: tool call — gather evidence from web search + top source.
+        evidence = await fact_check_tool.ainvoke({"claim": claim})
+        # Step 2: LLM reasoning — structured verdict from evidence.
+        messages = [SystemMessage(_VERIFY_PROMPT), HumanMessage(f"Claim: {claim}\n\nEvidence:\n{evidence}")]
+        response = await llm_invoke_with_retry(llm, messages, config)
+        parsed = _VerifyResult.model_validate_json(str(response.content))
+        return {"results": [{"claim": claim, "supported": parsed.supported,
+                              "confidence": parsed.confidence, "reason": parsed.reason}]}
+    return verifier_node
 
-search_graph = StateGraph(SearchState)
-search_graph.add_node("router", lambda s: s)
-search_graph.add_node("searcher", searcher_node)
-search_graph.add_conditional_edges("router", route_to_searchers)
-search_graph.add_edge("searcher", END)
-search_subgraph = search_graph.compile()
-# Parent graph receives: {"search_results": state["results"]} from the subgraph output mapper
+verify_graph = StateGraph(VerificationState)
+verify_graph.add_node("router", lambda s: s)
+verify_graph.add_node("verifier", make_verifier_node(llm, fact_check_tool))
+verify_graph.add_conditional_edges("router", route_to_verifiers)
+verify_graph.add_edge("verifier", END)
+verify_subgraph = verify_graph.compile()
+# Parent graph receives: {"verification_results": state["results"]} from the subgraph output mapper
 ```
+
+The output guard reads `verification_results` deterministically — no extra LLM call. If any
+result has `supported=False`, the guard blocks and replaces `final_answer` with a safe fallback.
+On parse failure inside a verifier branch, `supported=True` is used (fail-open) to avoid
+false blocks from transient LLM errors.
 
 ### ReAct — Non-deterministic Steps (in `react_researcher`)
 
@@ -385,14 +457,16 @@ def after(next_node: str) -> Callable[[AgentState], str]:
     return _route
 
 # Usage on each edge:
-graph.add_conditional_edges("planner", after("search_subgraph"))
-graph.add_conditional_edges("search_subgraph", after("react_researcher"))
+graph.add_conditional_edges("planner", after("resume_guard"))
+graph.add_conditional_edges("resume_guard", ...)  # routes to react_researcher or dead_letter
+graph.add_conditional_edges("writer", after("verify_subgraph"))
+graph.add_conditional_edges("verify_subgraph", after("reflection_subgraph"))
 # … etc.
 ```
 
 Nodes decorated with `@with_dead_letter("node_name")`: `input_guard`, `planner`,
 `react_researcher` (and its `ToolNode` wrapper), `writer`, `output_guard`.
-The two subgraphs (`search_subgraph`, `reflection_subgraph`) are wrapped at the parent level
+The two subgraphs (`verify_subgraph`, `reflection_subgraph`) are wrapped at the parent level
 via the `after()` routing helper so internal subgraph exceptions still route to `dead_letter`.
 
 ### Circuit Breakers & Loop Guards
@@ -473,13 +547,34 @@ different ceilings without redeploying.
 
 ---
 
-### Guardrails — Input and Output
+### Guardrails — Input, Resume, and Output
 
-**Input guard** (`input_guard.py`): first node after `START`. Asks the LLM to classify the user's request as `safe` or `unsafe` against a system prompt that describes allowed topics. Routes to `END` immediately (sets `status="blocked"`, `guard_reason=...`) on failure — the planner never runs.
+Three guard nodes protect every user-facing surface. All share a single `GLiGuardClient` singleton loaded in `lifespan`.
 
-**Output guard** (`output_guard.py`): last node before `END`. Checks the `final_answer` for factual grounding in `search_results` and absence of harmful content. On failure: sets `status="blocked"` and replaces `final_answer` with a safe fallback message rather than routing through refiner again (keeps the graph acyclic beyond reflection).
+**Input guard** (`input_guard.py`): first node after `START`. Three layers applied in order, short-circuiting on block:
+1. Regex blocklist — null bytes, XML injection tags (`<system>`, `</s>`), bare tool-call syntax; <1ms, zero cost.
+2. GLiGuard (`fastino/gliguard-LLMGuardrails-300M`, 300M) — prompt injection, jailbreak, PII; ~15ms GPU; returns span offsets.
+3. LLM topic check — research-domain relevance only (safety is owned by layer 2); ~300ms.
+Routes to `END: blocked` (sets `status="blocked"`, `guard_reason=...`) on any failure — `planner` never runs.
 
-Both guards use a small, structured LLM call that returns `{"verdict": "safe"|"unsafe", "reason": "..."}` parsed with Pydantic.
+**Planner** (`planner.py`): after generating the plan text, guards it (GLiGuard + LLM quality check) before calling `interrupt({"plan": plan_text})`. If the plan is unsafe, returns `status="blocked"` without interrupting — the plan is never surfaced to the user.
+
+**Resume guard** (`resume_guard.py`): node immediately after `planner` on the approved path. Checks the resume message that the user sent alongside `approve=true/false` (layers 1 and 2 only — topic was already validated on the first turn). Routes to `END: blocked` on failure; to `react_researcher` on pass. The resume message is added to `state["messages"]` by the router before `Command(resume=...)` so the node can read it from `state["messages"][-1]`.
+
+**Output guard** (`output_guard.py`): last node before `END`. Two layers:
+1. GLiGuard — detects PII spans (email, phone, SSN, card, API key, IP); redacts in-place with `[REDACTED:<type>]`; does not block.
+2. Deterministic verification check — reads `verification_results` from `verify_subgraph`; blocks if any claim is marked `supported=False`; no LLM call.
+
+**Guard model — chosen and alternatives:**
+
+| Model | Params | Package | German | Threat scope | Notes |
+|---|---|---|---|---|---|
+| **GLiGuard** (`fastino/gliguard-LLMGuardrails-300M`) ✓ **chosen** | 300M | `gliner2[local]` | Yes (100+ langs, mmBERT) | Prompt + response safety, toxicity (multi-label), jailbreak, PII, 13+ categories | Apache 2.0; evaluates both input and output; 16x faster than comparable accuracy; CPU-optimized |
+| Llama Prompt Guard 2 86M (`meta-llama/Llama-Prompt-Guard-2-86M`) | 86M | `transformers` | Yes (8 langs) | Prompt injection + jailbreak (binary only) | Llama 4 license; AUC 0.998, 97.5% recall @ 1% FPR; no response-side classification |
+| Llama Prompt Guard 2 22M (`meta-llama/Llama-Prompt-Guard-2-22M`) | 22M | `transformers` | Yes (8 langs) | Prompt injection + jailbreak (binary only) | Llama 4 license; 19.3ms latency; best for edge/mobile; AUC 0.995 |
+| Llama Guard 3 1B (`meta-llama/Llama-Guard-3-1B`) | 1B | `transformers` | Yes (8 langs) | 13 MLCommons harm categories, prompt + response | Llama 3.2 license; best breadth for general content safety; F1 0.899 |
+
+GLiGuard was chosen because it covers both prompt and response classification, supports multi-label harm taxonomy, and is the only option with published per-response-side benchmarks. The Llama PG2 models are narrower (injection/jailbreak only, binary) but faster and have better-validated German benchmarks. Switch to Llama Guard 3 1B if harm-category granularity (e.g. weapons, election content) matters more than speed.
 
 ---
 
@@ -579,7 +674,7 @@ app.state.graph = compile_graph(checkpointer, mcp_tools, node_llm_configs)
 
 `llm_invoke_with_retry` reads `timeout_seconds` and `max_retries` from the LLM instance's metadata rather than directly from `settings`, so per-node overrides flow through automatically.
 
-**Valid node keys**: `input_guard`, `planner`, `react_researcher`, `writer`, `output_guard`, `reflection` (covers both critic and refiner inside the reflection subgraph — they share one LLM instance).
+**Valid node keys**: `input_guard`, `planner`, `react_researcher`, `writer`, `verification` (verifier branches inside `verify_subgraph`), `reflection` (covers both critic and refiner inside `reflection_subgraph` — they share one LLM instance).
 
 ---
 
@@ -657,12 +752,12 @@ Config: `AGENT_MCP_SERVER_URL` (default `http://localhost:8001`).
 - `nodes/_dead_letter.py` — `DeadLetterInfo` TypedDict, `with_dead_letter(node_name)` decorator, `dead_letter_node`, `after(next_node)` routing helper
 - `nodes/input_guard.py` — LLM-based input guardrail; routes to END on block
 - `nodes/planner.py` — async node with `interrupt({"plan": ...})`; resume via `Command(resume=True/False)`; reject → status="aborted"
-- `nodes/subgraphs/search.py` — async subgraph; `Send` API fans out one searcher per plan step; `operator.add` reducer fans in results
+- `nodes/subgraphs/verification.py` — async subgraph; `Send` API fans out one verifier per claim; each branch: `fact_check` tool call + LLM verdict; `operator.add` reducer fans in structured results
 - `nodes/react_researcher.py` — ReAct loop: `llm.bind_tools(mcp_tools)` + `ToolNode`; exits via `tools_condition` when model stops calling tools
-- `nodes/writer.py` — async node; drafts `draft_answer` from accumulated context
+- `nodes/writer.py` — async node; drafts `draft_answer` and extracts verifiable `claims` as JSON; falls back to raw prose + empty claims on parse failure
 - `nodes/subgraphs/reflection.py` — async subgraph; critic → refiner loop until quality criteria met; no hard cap
-- `nodes/output_guard.py` — LLM-based output guardrail; replaces answer with safe fallback on failure
-- `mcp/server.py` — `fastmcp` server with `web_search` + `fetch_url` tools
+- `nodes/output_guard.py` — two-layer guardrail: GLiGuard PII redaction (layer 1) + deterministic check of `verification_results` (layer 2, no LLM); replaces answer with safe fallback on any unsupported claim
+- `mcp/server.py` — `fastmcp` server with `web_search`, `fetch_url`, and `fact_check` tools
 - `graph/mcp_client.py` — `MultiServerMCPClient` factory returning `BaseTool`-compatible list
 - `exceptions.py` — `LLMError`, `LLMRateLimitError`, `LLMServiceUnavailableError`, `LLMServiceError`
 - `graph/nodes/_llm_invoke.py` — centralized async LLM wrapper with error translation; `NodeLLMConfig` dataclass; `build_llm(override)` merges node overrides onto global settings
@@ -675,14 +770,15 @@ Config: `AGENT_MCP_SERVER_URL` (default `http://localhost:8001`).
 - `tests/graph/nodes/test_dead_letter.py` — decorator catches exception and populates `DeadLetterInfo`; `after()` routes to `dead_letter` when field is set; clean state routes to next node
 - `tests/graph/nodes/test_input_guard.py` — blocks off-topic, passes valid research query
 - `tests/graph/nodes/test_planner.py` — emits interrupt, resumes on approve, aborts on reject
-- `tests/graph/nodes/subgraphs/test_search.py` — fan-out creates N searcher invocations, results accumulated
+- `tests/graph/nodes/subgraphs/test_verification.py` — supported/unsupported claims, parse-failure fail-open, N claims → N results, empty claims → empty results, no tool → skips call
 - `tests/graph/nodes/test_react_researcher.py` — loop runs N tool steps then exits; empty tool list exits immediately
 - `tests/graph/nodes/subgraphs/test_reflection.py` — passes on first attempt, refines on fail, exits without hard cap
-- `tests/graph/nodes/test_output_guard.py` — blocks harmful output, passes clean answer
+- `tests/graph/nodes/test_writer.py` — valid JSON response extracts claims; parse failure falls back to raw prose + empty claims
+- `tests/graph/nodes/test_output_guard.py` — PII redacted, all supported → done, any unsupported → blocked, empty results → done
 - `tests/graph/nodes/test_llm_invoke.py` — rate limit, connection error, 5xx, 4xx → correct exception type
 - `tests/test_exception_handlers.py` — 429, 503, 500 HTTP status codes
 - `tests/graph/nodes/test_node_config.py` — `config["configurable"]["node_llms"]["planner"]` overrides LLM
-- `tests/mcp/test_server.py` — `web_search` and `fetch_url` tools return strings, MCP schema is valid
+- `tests/mcp/test_server.py` — `web_search`, `fetch_url`, and `fact_check` tools return strings, MCP schema is valid
 
 **Done when**: Full multi-turn interrupt/resume conversation works end-to-end via curl; MCP server starts standalone.
 
@@ -1137,20 +1233,68 @@ Unbounded inputs allow prompt-stuffing attacks (very long `message` fields that 
 **Tests**:
 - `tests/test_models.py` — message over 4096 chars → `ValidationError`; thread_id over 128 chars → `ValidationError`.
 
-#### 4.5 — Prompt Injection Defence (Structured Prompts)
+#### 4.5 — Guardrail Upgrade: Three-Layer Input Guard
 
-The input guard classifies user intent but does not prevent a crafted user message from leaking into other nodes' system prompts. For example, a user message containing `\nIgnore previous instructions` is passed verbatim to the planner and writer.
+The current `input_guard` node uses a single LLM call to classify safety and topic relevance. This is expensive (~500ms), susceptible to prompt injection itself, and has no PII or injection-pattern detection. It is also only applied on the first turn — the resume message sent after a human-in-the-loop interrupt is unchecked.
+
+Replace the single-LLM guard with a three-layer pipeline inside `input_guard` and add a router-level check for multi-turn resume messages.
+
+**Three layers (applied in order, short-circuit on block):**
+
+| Layer | Tool | What it catches | Latency |
+|---|---|---|---|
+| 1 — Regex blocklist | `_prompt_utils.py` | Null bytes, oversized spans, XML injection markers (`<system>`, `</s>`), repeated newlines, bare tool-call syntax | <1ms |
+| 2 — GLiGuard | `fastino/gliguard-LLMGuardrails-300M` (300M) | Prompt injection, jailbreak, PII in input (span-level offsets) | ~15ms GPU |
+| 3 — LLM topic check | existing `_llm_invoke` | Off-topic / irrelevant requests (research-domain relevance only — not safety, which layer 2 owns) | ~300ms |
+
+Layer 3 scope is narrowed: remove the safety classification prompt from the LLM call (GLiGuard owns that) and keep only the topic-relevance check so the LLM focuses on what it does best.
+
+**Multi-turn coverage**: `resume_guard` is a new graph node wired between `planner` (approved) and `react_researcher`. It checks the resume message the user sent alongside `approve=true/false`. The router adds `body.message` as a `HumanMessage` to state via `graph.aupdate_state` before `Command(resume=...)`, so `resume_guard` reads it from `state["messages"][-1]`. Layers 1 and 2 only — topic was validated on the first turn. On block: `status="blocked"`, `guard_reason` set, routes to `END: blocked`.
 
 **Deliverables**:
-- `app/graph/nodes/_prompt_utils.py` — `sanitize_user_text(text: str) -> str`:
-  - Strip or escape common injection markers: leading/trailing XML-like tags (`<system>`, `</s>`), repeated newlines, null bytes.
-  - Apply in `input_guard`, `planner`, and `writer` where `last_human.content` is interpolated into prompts.
-- Planner and writer system prompts already use hard `"""` delimiters around user content; add explicit role labels (`User question:`, `---`) to structurally separate user content from system instructions.
+- `app/graph/nodes/_prompt_utils.py` — `sanitize_user_text(text: str) -> str`: strip null bytes, XML-like injection tags, repeated newlines, oversized spans. Returns cleaned string; raises `ValueError` on unrecoverable input.
+- `app/guards/gliguard.py` — `GLiGuardClient` (singleton, loaded in `lifespan`): wraps `fastino/gliguard-LLMGuardrails-300M` via the `gliner` Python library; exposes `check_input(text: str) -> GuardResult` and `check_output(text: str) -> GuardResult`; `GuardResult` is a dataclass with `blocked: bool`, `reason: str | None`, `flagged_spans: list[Span]`.
+- `app/guards/__init__.py` — re-exports `GLiGuardClient`, `GuardResult`.
+- `nodes/input_guard.py` — updated: call `sanitize_user_text` → `GLiGuardClient.check_input` → LLM topic check. Short-circuit to `END: blocked` on any layer failure.
+- `nodes/resume_guard.py` — new node: call `sanitize_user_text` → `GLiGuardClient.check_input` on `state["messages"][-1].content`. Routes to `search_subgraph` on pass, `END: blocked` on failure.
+- `nodes/planner.py` — updated: after generating `plan`, run GLiGuard + LLM check on plan text before calling `interrupt({"plan": plan_text})`; if unsafe, return `{"status": "blocked", "guard_reason": ...}` without interrupting.
+- `routers.py` — resume path: call `graph.aupdate_state(config, {"messages": [HumanMessage(content=body.message)]})` before `Command(resume=...)`so `resume_guard` can read the message.
+- `workflow.py` — wire `planner` (approved) → `resume_guard` → `search_subgraph`; add `resume_guard` to `@with_dead_letter` and `after()` routing.
+- `main.py` lifespan — instantiate `GLiGuardClient` once; store on `app.state.gliguard`; pass to guard nodes via `compile_graph`.
+- `config.py` — add `AGENT_GUARD_MODEL` (default `fastino/gliguard-LLMGuardrails-300M`) and `AGENT_GUARD_DEVICE` (default `cpu`; set `cuda` or `mps` for GPU).
 
 **Tests**:
-- `tests/graph/nodes/test_prompt_utils.py` — injection markers stripped; normal text passes through unchanged.
+- `tests/guards/test_gliguard.py` — mock model; injection input → `blocked=True` with span; clean input → `blocked=False`; PII in input → `blocked=True`.
+- `tests/graph/nodes/test_input_guard.py` — layer-1 null-byte blocked before GLiGuard; layer-2 injection blocked before LLM; off-topic passes 1–2 but blocked by LLM.
+- `tests/graph/nodes/test_resume_guard.py` — injection in resume message → `END: blocked`; clean resume message → routes to `react_researcher`.
+- `tests/graph/nodes/test_planner.py` — add cases: unsafe plan text → `status="blocked"`, no interrupt fired; safe plan → interrupt fires normally.
+- `tests/graph/nodes/test_prompt_utils.py` — injection markers stripped; null bytes stripped; normal text unchanged.
 
-#### 4.6 — Dependency Vulnerability Scanning
+---
+
+#### 4.6 — Guardrail Upgrade: Output Guard PII Redaction
+
+The current `output_guard` uses a single LLM call to check grounding and safety. It does not detect or redact PII (emails, phone numbers, API keys, credit card numbers) that may leak into the generated answer from search results.
+
+Add GLiGuard (same model instance from 4.5) as a PII redaction pass before a deterministic claim verification check (no LLM call in the output guard).
+
+**Two layers (applied in order):**
+
+| Layer | Tool | What it catches |
+|---|---|---|
+| 1 — GLiGuard | `GLiGuardClient.check_output` | PII spans (email, phone, SSN, card, API key, IP); span offsets used for surgical redaction |
+| 2 — Deterministic verification | `verification_results` from `verify_subgraph` | Any claim marked `supported=False` triggers a block with safe fallback message |
+
+On PII detection: redact the flagged spans in `final_answer` (replace with `[REDACTED:<type>]`) and log a structured warning. Do not block the response — redact and continue. If any claim is unsupported, block (status=`"blocked"`, safe fallback message).
+
+**Deliverables**:
+- `nodes/output_guard.py` — updated: call `GLiGuardClient.check_output(state["final_answer"])` first; apply span redaction if PII found; then call LLM grounding/safety check on the redacted answer.
+- `app/guards/gliguard.py` — add `redact(text: str, spans: list[Span]) -> str` helper: replaces character ranges with `[REDACTED:<entity_type>]`, processes spans in reverse order to preserve offsets.
+
+**Tests**:
+- `tests/graph/nodes/test_output_guard.py` — add cases: answer with email → email redacted, answer passes; answer with hallucination → blocked by LLM check; clean answer → passes both layers.
+
+#### 4.7 — Dependency Vulnerability Scanning
 
 No automated check currently flags known CVEs in the dependency tree.
 
@@ -1165,7 +1309,7 @@ No automated check currently flags known CVEs in the dependency tree.
 
 ---
 
-#### 4.7 — SSE Keepalive
+#### 4.8 — SSE Keepalive
 
 Long-running pipelines (search subgraph + ReAct loop) can be silent for minutes before the writer emits its first token. Reverse proxies (Nginx default: 60s, AWS ALB: 60s) close idle SSE connections during this silence.
 
@@ -1183,6 +1327,8 @@ Long-running pipelines (search subgraph + ReAct loop) can be silent for minutes 
 - A DNS-rebinding mock test passes in `tests/mcp/test_ssrf.py`.
 - `uv run task audit` exits 0 on the current dependency set.
 - A message of 5000 characters is rejected with 422 before reaching any LLM node.
+- An injection string in `body.message` on a resume POST returns HTTP 400 before the graph is invoked.
+- An email address in a generated answer is redacted to `[REDACTED:email]` before the response is returned.
 
 ---
 
@@ -1262,11 +1408,18 @@ dependencies = [
     "langchain-mcp-adapters>=0.1.3",           # pin patch: <0.1.3 has breaking tool schema bug
     "logger",                                  # custom structlog wrapper: get_logger() + configure_logging()
     "slowapi>=0.1",                            # Phase 4: rate limiting (ASGI-compatible, Redis-optional)
+    "gliner2[local]>=0.2",                      # Phase 4: GLiGuard — input/output PII + injection + jailbreak guard
 ]
 
 dev_dependencies = [
     "pip-audit",                               # Phase 4: dependency vulnerability scanning
 ]
+
+# GLiGuard model downloaded at first use via HuggingFace Hub:
+#   fastino/gliguard-LLMGuardrails-300M  — 300M, Apache 2.0, mmBERT backbone
+#   Covers: prompt injection, jailbreak, PII, toxicity (multi-label), response safety
+#   Install: pip install "gliner2[local]"   (NOT the older gliner package)
+#   16x faster than comparable-accuracy models; CPU-optimized; 100+ language support via mmBERT
 ```
 
 ---
@@ -1387,7 +1540,7 @@ This separation means Studio can inspect the graph topology without starting a P
 - **Phase 1**: `uv run pytest tests/ -k "checkpoint or time_travel"` passes; `curl http://localhost:8000/health` → 200
 - **Phase 2**: multi-turn interrupt/resume via curl; subgraph nodes visible in checkpoint history; `uv run python -m app.mcp.server` starts; guardrail blocks a test prompt
 - **Phase 3**: `curl -N -X POST /v1/chat/stream` emits token frames
-- **Phase 4**: unauthenticated requests return 401; DNS-rebinding mock test passes; `uv run task audit` exits 0; 5000-char message rejected with 422
+- **Phase 4**: unauthenticated requests return 401; DNS-rebinding mock test passes; `uv run task audit` exits 0; 5000-char message rejected with 422; injection in resume body returns 400; PII in generated answer redacted before response
 - **Phase 5**: `uv run task experiment` writes results JSON; both quality scores and trace assertion results visible in Langfuse UI
 
 ---

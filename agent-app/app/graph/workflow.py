@@ -4,15 +4,15 @@ Exposes two functions:
   create_graph()   — returns the uncompiled StateGraph (LangGraph Studio).
   compile_graph()  — compiles with checkpointer + LLM + MCP tools (main.py lifespan).
 
-Full Phase 2 graph:
-  START → input_guard → planner (interrupt) → search_subgraph → react_researcher
-         → writer → reflection_subgraph → output_guard → END
+Full graph:
+  START → input_guard → planner (interrupt) → resume_guard → react_researcher
+        → writer → verify_subgraph → reflection_subgraph → output_guard → END
 
 Dead-letter routing: every node that can raise is wrapped with @with_dead_letter.
 The after() helper is used on each outgoing edge to detect dead_letter before
 routing to the next planned node.  The terminal dead_letter node is added once.
 
-Subgraph wrappers: search and reflection subgraphs use disjoint state keys and
+Subgraph wrappers: verify and reflection subgraphs use disjoint state keys and
 must be invoked via wrapper nodes that translate AgentState ↔ internal state.
 """
 
@@ -35,10 +35,26 @@ from app.graph.nodes.input_guard import make_input_guard_node
 from app.graph.nodes.output_guard import make_output_guard_node
 from app.graph.nodes.planner import make_planner_node
 from app.graph.nodes.react_researcher import make_react_researcher_node_from_llm
+from app.graph.nodes.resume_guard import make_resume_guard_node
 from app.graph.nodes.subgraphs.reflection import ReflectionState, build_reflection_subgraph
-from app.graph.nodes.subgraphs.search import SearchState, search_subgraph
+from app.graph.nodes.subgraphs.verification import VerificationState, build_verify_subgraph
 from app.graph.nodes.writer import make_writer_node
 from app.graph.state import AgentState
+from app.guards.gliguard import GLiGuardClient
+
+
+class _NullGuard:
+    """No-op GLiGuardClient for use in LangGraph Studio (create_graph) where no model is loaded."""
+
+    def check_input(self, text: str):  # type: ignore[return]
+        from app.guards.gliguard import GuardResult
+
+        return GuardResult(blocked=False)
+
+    def check_output(self, text: str):  # type: ignore[return]
+        from app.guards.gliguard import GuardResult
+
+        return GuardResult(blocked=False)
 
 
 def _react_condition(state: AgentState) -> Literal["tools", "writer"]:
@@ -59,22 +75,36 @@ def _input_guard_condition(state: AgentState) -> Literal["planner", "dead_letter
     return "__end__" if state.get("status") == "blocked" else "planner"
 
 
-def _planner_condition(state: AgentState) -> Literal["search_subgraph", "dead_letter", "__end__"]:
-    """Route after planner: exception → dead_letter, aborted → END, approved → search."""
+def _planner_condition(state: AgentState) -> Literal["resume_guard", "dead_letter", "__end__"]:
+    """Route after planner: exception → dead_letter, aborted/blocked → END, approved → resume_guard."""
     if state.get("dead_letter"):
         return "dead_letter"
-    return "__end__" if state.get("status") == "aborted" else "search_subgraph"
+    if state.get("status") in ("aborted", "blocked"):
+        return "__end__"
+    return "resume_guard"
 
 
-async def _run_search(state: AgentState, config: RunnableConfig) -> dict:
-    """Wrapper node that maps AgentState → SearchState → AgentState."""
-    search_input: SearchState = {
-        "queries": state.get("plan", []),  # type: ignore[arg-type]
-        "query": "",
-        "results": [],
-    }
-    result = await search_subgraph.ainvoke(search_input, config)
-    return {"search_results": result["results"], "status": "researching"}
+def _resume_guard_condition(state: AgentState) -> Literal["react_researcher", "dead_letter", "__end__"]:
+    """Route after resume_guard: exception → dead_letter, blocked → END, safe → react_researcher."""
+    if state.get("dead_letter"):
+        return "dead_letter"
+    return "__end__" if state.get("status") == "blocked" else "react_researcher"
+
+
+def _make_run_verification(llm: BaseChatModel, fact_check_tool: BaseTool | None) -> Callable:
+    """Return a wrapper node that maps AgentState → VerificationState → AgentState."""
+    compiled = build_verify_subgraph(llm, fact_check_tool)
+
+    async def run_verification(state: AgentState, config: RunnableConfig) -> dict:
+        verification_input: VerificationState = {
+            "claims": state.get("claims", []),  # type: ignore[arg-type]
+            "claim": "",
+            "results": [],
+        }
+        result = await compiled.ainvoke(verification_input, config)
+        return {"verification_results": result["results"], "status": "verifying"}
+
+    return run_verification
 
 
 def _make_run_reflection(llm: BaseChatModel) -> Callable:
@@ -102,34 +132,41 @@ def _make_run_reflection(llm: BaseChatModel) -> Callable:
 def _build_graph(
     default_llm: BaseChatModel,
     mcp_tools: list[BaseTool],
+    gliguard: GLiGuardClient | _NullGuard,
+    fact_check_tool: BaseTool | None = None,
     node_llms: Mapping[str, BaseChatModel] | None = None,
 ) -> StateGraph:
     nlm = node_llms or {}
     graph: StateGraph = StateGraph(AgentState)
 
     # Nodes — each falls back to default_llm when not overridden
-    graph.add_node("input_guard", make_input_guard_node(nlm.get("input_guard", default_llm)))
-    graph.add_node("planner", make_planner_node(nlm.get("planner", default_llm)))
-    graph.add_node("search_subgraph", _run_search)
+    graph.add_node("input_guard", make_input_guard_node(nlm.get("input_guard", default_llm), gliguard))  # type: ignore[arg-type]
+    graph.add_node("planner", make_planner_node(nlm.get("planner", default_llm), gliguard))  # type: ignore[arg-type]
+    graph.add_node("resume_guard", make_resume_guard_node(gliguard))  # type: ignore[arg-type]
     graph.add_node(
         "react_researcher", make_react_researcher_node_from_llm(nlm.get("react_researcher", default_llm), mcp_tools)
     )
     graph.add_node("tools", ToolNode(mcp_tools))
     graph.add_node("writer", make_writer_node(nlm.get("writer", default_llm)))
+    graph.add_node(
+        "verify_subgraph",
+        _make_run_verification(nlm.get("verification", default_llm), fact_check_tool),
+    )
     graph.add_node("reflection_subgraph", _make_run_reflection(nlm.get("reflection", default_llm)))
-    graph.add_node("output_guard", make_output_guard_node(nlm.get("output_guard", default_llm)))
+    graph.add_node("output_guard", make_output_guard_node(gliguard))  # type: ignore[arg-type]
     graph.add_node("dead_letter", dead_letter_node)
 
     # Edges
     graph.add_edge(START, "input_guard")
     graph.add_conditional_edges("input_guard", _input_guard_condition)
     graph.add_conditional_edges("planner", _planner_condition)
-    graph.add_conditional_edges("search_subgraph", after("react_researcher"))
+    graph.add_conditional_edges("resume_guard", _resume_guard_condition)
     graph.add_conditional_edges("react_researcher", _react_condition)
     graph.add_edge("tools", "react_researcher")
-    graph.add_conditional_edges("writer", after("reflection_subgraph"))
+    graph.add_conditional_edges("writer", after("verify_subgraph"))
+    graph.add_conditional_edges("verify_subgraph", after("reflection_subgraph"))
     graph.add_conditional_edges("reflection_subgraph", after("output_guard"))
-    graph.add_edge("output_guard", END)
+    graph.add_conditional_edges("output_guard", after(END))
     graph.add_edge("dead_letter", END)
 
     return graph
@@ -174,14 +211,15 @@ def create_graph() -> StateGraph:
     """Return the uncompiled StateGraph for LangGraph Studio.
 
     Studio injects its own checkpointer and MCP client, so this builds
-    the graph with a default LLM and empty tool list.
+    the graph with a default LLM, empty tool list, and a no-op guard.
     """
-    return _build_graph(build_llm(), [])
+    return _build_graph(build_llm(), [], _NullGuard(), fact_check_tool=None)
 
 
 def compile_graph(
     checkpointer: BaseCheckpointSaver,
     mcp_tools: list[BaseTool],
+    gliguard: GLiGuardClient,
     node_llm_configs: dict[str, NodeLLMConfig] | None = None,
 ) -> CompiledStateGraph:
     """Compile the graph with a Postgres checkpointer for production use.
@@ -192,10 +230,12 @@ def compile_graph(
     Args:
         checkpointer: Async Postgres checkpointer from lifespan.
         mcp_tools: MCP tools loaded from the tool server (via load_mcp_tools()).
+        gliguard: Loaded GLiGuardClient singleton from lifespan.
         node_llm_configs: Per-node LLM overrides keyed by node name.
             Valid keys: input_guard, planner, react_researcher, writer,
-            output_guard, reflection.
+            verification, reflection.
     """
     default_llm = build_llm()
+    fact_check_tool = next((t for t in mcp_tools if t.name == "fact_check"), None)
     node_llms = {name: build_llm(cfg) for name, cfg in (node_llm_configs or {}).items()}
-    return _build_graph(default_llm, mcp_tools, node_llms).compile(checkpointer=checkpointer)
+    return _build_graph(default_llm, mcp_tools, gliguard, fact_check_tool, node_llms).compile(checkpointer=checkpointer)

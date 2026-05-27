@@ -128,6 +128,15 @@ class TestLlmInvokeMetadataOverride:
         llm.ainvoke.assert_awaited_once()
 
 
+def _make_null_gliguard() -> MagicMock:
+    from app.guards.gliguard import GLiGuardClient, GuardResult
+
+    g = MagicMock(spec=GLiGuardClient)
+    g.check_input.return_value = GuardResult(blocked=False)
+    g.check_output.return_value = GuardResult(blocked=False)
+    return g
+
+
 class TestCompileGraphNodeLLMConfigs:
     def test_build_llm_called_once_without_configs(self) -> None:
         from langgraph.checkpoint.memory import InMemorySaver
@@ -138,7 +147,7 @@ class TestCompileGraphNodeLLMConfigs:
         fake_llm.bind_tools = MagicMock(return_value=fake_llm)
 
         with patch("app.graph.workflow.build_llm", return_value=fake_llm) as mock_build_llm:
-            compile_graph(InMemorySaver(), mcp_tools=[], node_llm_configs=None)
+            compile_graph(InMemorySaver(), mcp_tools=[], gliguard=_make_null_gliguard(), node_llm_configs=None)
 
         mock_build_llm.assert_called_once_with()
 
@@ -159,7 +168,9 @@ class TestCompileGraphNodeLLMConfigs:
         fake_llm.bind_tools = MagicMock(return_value=fake_llm)
 
         with patch("app.graph.workflow.build_llm", return_value=fake_llm) as mock_build_llm:
-            compile_graph(InMemorySaver(), mcp_tools=[], node_llm_configs=node_llm_configs)
+            compile_graph(
+                InMemorySaver(), mcp_tools=[], gliguard=_make_null_gliguard(), node_llm_configs=node_llm_configs
+            )
 
         # First call: default_llm with no args; then one call per node config entry
         assert mock_build_llm.call_args_list[0] == call()
@@ -187,7 +198,9 @@ class TestCompileGraphNodeLLMConfigs:
         fake_llm.bind_tools = MagicMock(return_value=fake_llm)
 
         with patch("app.graph.workflow.build_llm", return_value=fake_llm) as mock_build_llm:
-            compile_graph(InMemorySaver(), mcp_tools=[], node_llm_configs=node_llm_configs)
+            compile_graph(
+                InMemorySaver(), mcp_tools=[], gliguard=_make_null_gliguard(), node_llm_configs=node_llm_configs
+            )
 
         all_calls = mock_build_llm.call_args_list
         # One default call + 6 per-node calls

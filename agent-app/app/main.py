@@ -1,7 +1,7 @@
 """Agent App — FastAPI entry point.
 
 Lifecycle:
-  startup  → load MCP tools, create AsyncPostgresSaver, compile graph.
+  startup  → load MCP tools, create AsyncPostgresSaver, load GLiGuardClient, compile graph.
   shutdown → checkpointer connection pool is closed via async context manager.
 
 The compiled graph is stored on app.state.graph and injected into endpoints
@@ -28,6 +28,7 @@ from app.config import settings
 from app.graph.mcp_client import load_mcp_tools
 from app.graph.nodes._llm_invoke import NodeLLMConfig
 from app.graph.workflow import compile_graph
+from app.guards.gliguard import GLiGuardClient
 from app.routers import router
 
 configure_logging()
@@ -46,6 +47,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     mcp_tools = await load_mcp_tools(settings.mcp_server_url)
     logger.info("MCP tools loaded", tool_count=len(mcp_tools))
 
+    gliguard = GLiGuardClient(settings.guard_model, settings.guard_device)
+    gliguard.load()
+    app.state.gliguard = gliguard
+    logger.info("GLiGuard loaded", model=settings.guard_model, device=settings.guard_device)
+
     node_llm_configs: dict[str, NodeLLMConfig] = {
         "input_guard": NodeLLMConfig(temperature=0.0),
         "planner": NodeLLMConfig(temperature=0.0),
@@ -57,7 +63,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     async with AsyncPostgresSaver.from_conn_string(settings.db_uri) as checkpointer:
         await checkpointer.setup()
-        app.state.graph = compile_graph(checkpointer, mcp_tools, node_llm_configs)
+        app.state.graph = compile_graph(checkpointer, mcp_tools, gliguard, node_llm_configs)
         logger.info("Graph compiled and ready")
         yield
 

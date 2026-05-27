@@ -13,6 +13,8 @@ Example .env:
     AGENT_MCP_SERVER_URL=http://localhost:8001/mcp
     AGENT_MAX_REFLECTION_ATTEMPTS=5
     AGENT_MAX_REACT_STEPS=10
+    AGENT_GUARD_MODEL=fastino/gliguard-LLMGuardrails-300M
+    AGENT_GUARD_DEVICE=cpu
     AGENT_APP_HOST=0.0.0.0
     AGENT_APP_PORT=8000
     AGENT_MCP_HOST=0.0.0.0
@@ -80,6 +82,18 @@ class Settings(BaseSettings):
             "Worst-case for this graph is ~26 (react=10 + reflection=10 + ~6 other nodes); "
             "50 is generous for normal runs while still bounding runaway execution."
         ),
+    )
+    web_search_max_results: int = Field(
+        default=10,
+        description="Server-side cap on max_results for web_search and fact_check MCP tools.",
+    )
+    guard_model: str = Field(
+        default="fastino/gliguard-LLMGuardrails-300M",
+        description="HuggingFace model name for the GLiGuard guardrail (GLiNER2-based).",
+    )
+    guard_device: str = Field(
+        default="cpu",
+        description="Device for GLiGuard inference: 'cpu', 'cuda', or 'mps'.",
     )
     app_host: str = Field(default="0.0.0.0", description="Bind host for the FastAPI app.")
     app_port: int = Field(default=8000, description="Bind port for the FastAPI app.")

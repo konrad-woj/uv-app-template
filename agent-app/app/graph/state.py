@@ -28,13 +28,14 @@ class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
     plan: list[str]  # planner output; each entry is one research step
     plan_approved: bool
-    search_results: list[str]  # written once by search_subgraph after fan-in
+    claims: list[str]  # verifiable factual claims extracted by writer
+    verification_results: list[dict]  # per-claim results from verify_subgraph
     react_steps: int  # incremented each ReAct iteration (observability)
     draft_answer: str  # writer output before reflection
     reflection_attempts: int
     reflection_passed: bool
     final_answer: str  # output_guard-approved answer returned to the caller
-    # Lifecycle: "planning" → "searching" → "researching" → "writing" →
+    # Lifecycle: "planning" → "researching" → "writing" → "verifying" →
     #            "reflecting" → "done" | "aborted" | "blocked" | "dead_lettered"
     status: str
     guard_reason: str | None  # set when input_guard or output_guard blocks

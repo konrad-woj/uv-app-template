@@ -39,3 +39,11 @@ class TestReplayRequest:
     def test_missing_checkpoint_id_rejected(self):
         with pytest.raises(ValidationError):
             ReplayRequest()  # type: ignore[call-arg]
+
+    def test_blank_checkpoint_id_rejected(self):
+        with pytest.raises(ValidationError):
+            ReplayRequest(checkpoint_id="   ")
+
+    def test_empty_checkpoint_id_rejected(self):
+        with pytest.raises(ValidationError):
+            ReplayRequest(checkpoint_id="")

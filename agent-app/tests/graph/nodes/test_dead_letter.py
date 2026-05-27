@@ -2,8 +2,11 @@
 
 from datetime import datetime
 
+import pytest
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphInterrupt
+from langgraph.types import Interrupt
 
 from app.graph.nodes._dead_letter import DeadLetterInfo, after, dead_letter_node, with_dead_letter
 from app.graph.state import AgentState
@@ -17,7 +20,8 @@ def _base_state(
         "messages": [HumanMessage(content="test")],
         "plan": [],
         "plan_approved": False,
-        "search_results": [],
+        "claims": [],
+        "verification_results": [],
         "react_steps": 0,
         "draft_answer": "",
         "reflection_attempts": 0,
@@ -63,6 +67,14 @@ class TestWithDeadLetterDecorator:
         result = await ts_node(_base_state(), _CONFIG)
         # Should not raise
         datetime.fromisoformat(result["dead_letter"]["timestamp"])
+
+    async def test_graph_interrupt_propagates_and_is_not_caught(self) -> None:
+        @with_dead_letter("interrupt_node")
+        async def interrupt_node(state: AgentState, config: RunnableConfig) -> dict:
+            raise GraphInterrupt([Interrupt({"plan": ["step 1"]})])
+
+        with pytest.raises(GraphInterrupt):
+            await interrupt_node(_base_state(), _CONFIG)
 
     async def test_preserves_function_name(self) -> None:
         @with_dead_letter("named_node")

@@ -81,15 +81,15 @@ class TestValidateUrl:
             _validate_url("ftp://example.com/file")
 
     def test_rejects_loopback_ip(self) -> None:
-        with pytest.raises(ValueError, match="Blocked non-global IP"):
+        with pytest.raises(ValueError, match="Blocked non-public IP"):
             _validate_url("http://127.0.0.1/admin")
 
     def test_rejects_aws_metadata_ip(self) -> None:
-        with pytest.raises(ValueError, match="Blocked non-global IP"):
+        with pytest.raises(ValueError, match="Blocked non-public IP"):
             _validate_url("http://169.254.169.254/latest/meta-data/")
 
     def test_rejects_private_ip_10_range(self) -> None:
-        with pytest.raises(ValueError, match="Blocked non-global IP"):
+        with pytest.raises(ValueError, match="Blocked non-public IP"):
             _validate_url("http://10.0.0.1/internal")
 
     def test_rejects_localhost_hostname(self) -> None:
@@ -114,5 +114,5 @@ class TestFetchUrl:
         assert len(result) <= 4000
 
     async def test_rejects_ssrf_url_before_making_request(self) -> None:
-        with pytest.raises(ValueError, match="Blocked non-global IP"):
+        with pytest.raises(ValueError, match="Blocked non-public IP"):
             await fetch_url("http://169.254.169.254/latest/meta-data/")

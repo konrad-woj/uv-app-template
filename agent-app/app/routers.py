@@ -51,7 +51,7 @@ import json
 from collections.abc import AsyncGenerator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -117,6 +117,9 @@ async def chat(
                 is_interrupted=True,
                 interrupt_value=_extract_interrupt_value(snapshot),
             )
+        # Write the resume message to state so resume_guard can inspect it.
+        if request.message:
+            await graph.aupdate_state(config, {"messages": [HumanMessage(content=request.message)]})
         result = await graph.ainvoke(Command(resume=request.approve), config)
     else:
         # Fresh turn: inject the new human message.
@@ -136,6 +139,7 @@ async def chat(
         interrupt_value=_extract_interrupt_value(post_snapshot) if now_interrupted else None,
         final_answer=result.get("final_answer"),
         guard_reason=result.get("guard_reason"),
+        dead_letter=result.get("dead_letter"),
     )
 
 
@@ -155,13 +159,15 @@ async def _emit_interrupt(interrupt_value: dict | None) -> AsyncGenerator[str]:
     yield f"event: interrupt\ndata: {json.dumps({'interrupt_value': interrupt_value})}\n\n"
 
 
-async def _generate(graph: CompiledStateGraph, graph_input, config: RunnableConfig, request: Request) -> AsyncGenerator[str]:
+async def _generate(
+    graph: CompiledStateGraph, graph_input, config: RunnableConfig, request: Request
+) -> AsyncGenerator[str]:
     try:
         async for event in graph.astream_events(graph_input, config, version="v2"):
             if await request.is_disconnected():
                 return
             if event["event"] == "on_chat_model_stream" and "writer" in event.get("tags", []):
-                token = event["data"]["chunk"].content
+                token = event["data"].get("chunk").content  # type: ignore[union-attr]
                 if isinstance(token, list):
                     token = "".join(b.get("text", "") for b in token if isinstance(b, dict) and b.get("type") == "text")
                 if token:
@@ -177,7 +183,11 @@ async def _generate(graph: CompiledStateGraph, graph_input, config: RunnableConf
         yield f"event: interrupt\ndata: {json.dumps({'interrupt_value': interrupt_value})}\n\n"
     else:
         state = snapshot.values
-        yield f"event: done\ndata: {json.dumps({'status': state.get('status', 'done'), 'final_answer': state.get('final_answer')})}\n\n"
+        status = state.get("status", "done")
+        if status == "dead_lettered":
+            yield f"event: error\ndata: {json.dumps({'status': status, 'dead_letter': state.get('dead_letter')})}\n\n"
+        else:
+            yield f"event: done\ndata: {json.dumps({'status': status, 'final_answer': state.get('final_answer')})}\n\n"
 
 
 @router.post("/v1/chat/stream", tags=["chat"])
@@ -214,6 +224,9 @@ async def chat_stream(
         )
 
     if is_interrupted:
+        # Write the resume message to state so resume_guard can inspect it.
+        if body.message:
+            await graph.aupdate_state(config, {"messages": [HumanMessage(content=body.message)]})
         graph_input = Command(resume=body.approve)
     else:
         graph_input = {"messages": [HumanMessage(content=body.message)], "status": "planning"}
@@ -285,10 +298,15 @@ async def replay(
         "recursion_limit": settings.max_pipeline_steps,
     }
     # None input = replay from checkpoint state; no new message injected.
-    result = await graph.ainvoke(None, config)
+    try:
+        result = await graph.ainvoke(None, config)
+    except Exception as exc:
+        # Postgres raises when checkpoint_id is not a valid UUID or doesn't exist.
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.checkpoint_id}") from exc
     return ChatResponse(
         thread_id=thread_id,
         status=result.get("status", "done"),
         final_answer=result.get("final_answer"),
         guard_reason=result.get("guard_reason"),
+        dead_letter=result.get("dead_letter"),
     )
