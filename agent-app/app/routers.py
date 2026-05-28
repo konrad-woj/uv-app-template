@@ -47,6 +47,7 @@ that specific historical state and continue from there:
   - ``"update"`` — state after ``aupdate_state()`` was called externally.
 """
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from typing import Annotated
@@ -63,6 +64,23 @@ from app.config import settings
 from app.dependencies import get_graph
 from app.exceptions import LLMRateLimitError, LLMServiceError, LLMServiceUnavailableError
 from app.models import ChatRequest, ChatResponse, CheckpointInfo, ReplayRequest
+from app.rate_limit import limiter
+
+# ---------------------------------------------------------------------------
+# Health router — no authentication required
+# ---------------------------------------------------------------------------
+
+health_router = APIRouter()
+
+
+@health_router.get("/health", tags=["meta"])
+async def health() -> dict:
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# API router — authentication applied in main.py via include_router(dependencies=...)
+# ---------------------------------------------------------------------------
 
 router = APIRouter()
 
@@ -78,14 +96,11 @@ def _extract_interrupt_value(snapshot) -> dict | None:
     return raw.value if hasattr(raw, "value") else None
 
 
-@router.get("/health", tags=["meta"])
-async def health() -> dict:
-    return {"status": "ok"}
-
-
 @router.post("/v1/chat", response_model=ChatResponse, tags=["chat"])
+@limiter.limit(settings.rate_limit or "10000/minute")
 async def chat(
-    request: ChatRequest,
+    request: Request,
+    body: ChatRequest,
     graph: Annotated[CompiledStateGraph, Depends(get_graph)],
 ) -> ChatResponse:
     """Invoke the graph for a new turn or resume from an interrupt.
@@ -101,7 +116,7 @@ async def chat(
     forward.
     """
     config: RunnableConfig = {
-        "configurable": {"thread_id": request.thread_id},
+        "configurable": {"thread_id": body.thread_id},
         "recursion_limit": settings.max_pipeline_steps,
     }
 
@@ -110,21 +125,21 @@ async def chat(
     is_interrupted = bool(snapshot.next) and snapshot.values
 
     if is_interrupted:
-        if request.approve is None:
+        if body.approve is None:
             return ChatResponse(
-                thread_id=request.thread_id,
+                thread_id=body.thread_id,
                 status="interrupted",
                 is_interrupted=True,
                 interrupt_value=_extract_interrupt_value(snapshot),
             )
         # Write the resume message to state so resume_guard can inspect it.
-        if request.message:
-            await graph.aupdate_state(config, {"messages": [HumanMessage(content=request.message)]})
-        result = await graph.ainvoke(Command(resume=request.approve), config)
+        if body.message:
+            await graph.aupdate_state(config, {"messages": [HumanMessage(content=body.message)]})
+        result = await graph.ainvoke(Command(resume=body.approve), config)
     else:
         # Fresh turn: inject the new human message.
         result = await graph.ainvoke(
-            {"messages": [HumanMessage(content=request.message)], "status": "planning"},
+            {"messages": [HumanMessage(content=body.message)], "status": "planning"},
             config,
         )
 
@@ -133,7 +148,7 @@ async def chat(
     now_interrupted = bool(post_snapshot.next) and bool(post_snapshot.values)
 
     return ChatResponse(
-        thread_id=request.thread_id,
+        thread_id=body.thread_id,
         status=result.get("status", "done"),
         is_interrupted=now_interrupted,
         interrupt_value=_extract_interrupt_value(post_snapshot) if now_interrupted else None,
@@ -162,10 +177,31 @@ async def _emit_interrupt(interrupt_value: dict | None) -> AsyncGenerator[str]:
 async def _generate(
     graph: CompiledStateGraph, graph_input, config: RunnableConfig, request: Request
 ) -> AsyncGenerator[str]:
+    """SSE event generator with keepalive ping frames.
+
+    Wraps astream_events with a per-event timeout so that a `: ping` comment
+    frame is emitted whenever the graph is silent longer than
+    settings.sse_keepalive_seconds.  This prevents reverse proxies from closing
+    idle connections during long-running graph stages (search, ReAct loop).
+    """
+    event_iter = graph.astream_events(graph_input, config, version="v2").__aiter__()
     try:
-        async for event in graph.astream_events(graph_input, config, version="v2"):
+        while True:
+            try:
+                event = await asyncio.wait_for(event_iter.__anext__(), timeout=settings.sse_keepalive_seconds)
+            except TimeoutError:
+                yield ": ping\n\n"
+                continue
+            except StopAsyncIteration:
+                break
+            except Exception as exc:
+                code, detail = _classify_error(exc)
+                yield f"event: error\ndata: {json.dumps({'code': code, 'detail': detail})}\n\n"
+                return
+
             if await request.is_disconnected():
                 return
+
             if event["event"] == "on_chat_model_stream" and "writer" in event.get("tags", []):
                 token = event["data"].get("chunk").content  # type: ignore[union-attr]
                 if isinstance(token, list):
@@ -191,6 +227,7 @@ async def _generate(
 
 
 @router.post("/v1/chat/stream", tags=["chat"])
+@limiter.limit(settings.rate_limit or "10000/minute")
 async def chat_stream(
     request: Request,
     body: ChatRequest,
@@ -274,9 +311,11 @@ async def get_history(
 
 
 @router.post("/v1/threads/{thread_id}/replay", response_model=ChatResponse, tags=["threads"])
+@limiter.limit(settings.rate_limit or "10000/minute")
 async def replay(
+    request: Request,
     thread_id: str,
-    request: ReplayRequest,
+    body: ReplayRequest,
     graph: Annotated[CompiledStateGraph, Depends(get_graph)],
 ) -> ChatResponse:
     """Re-execute the graph from a historical checkpoint (time-travel).
@@ -293,7 +332,7 @@ async def replay(
     config: RunnableConfig = {
         "configurable": {
             "thread_id": thread_id,
-            "checkpoint_id": request.checkpoint_id,
+            "checkpoint_id": body.checkpoint_id,
         },
         "recursion_limit": settings.max_pipeline_steps,
     }
@@ -302,7 +341,7 @@ async def replay(
         result = await graph.ainvoke(None, config)
     except Exception as exc:
         # Postgres raises when checkpoint_id is not a valid UUID or doesn't exist.
-        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.checkpoint_id}") from exc
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {body.checkpoint_id}") from exc
     return ChatResponse(
         thread_id=thread_id,
         status=result.get("status", "done"),

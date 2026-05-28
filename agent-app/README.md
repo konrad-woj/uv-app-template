@@ -8,8 +8,8 @@ Each node in the graph is a vehicle for exactly one LangGraph or agentic pattern
 
 | Pattern | Where | Mechanism |
 |---|---|---|
-| **Subgraph** | `search_subgraph`, `reflection_subgraph` | Compiled `StateGraph` added as a single node via wrapper |
-| **Fan-out / Fan-in** | Inside `search_subgraph` | `Send` API spawns parallel searchers; `operator.add` reducer collects results |
+| **Subgraph** | `verify_subgraph`, `reflection_subgraph` | Compiled `StateGraph` added as a single node via wrapper |
+| **Fan-out / Fan-in** | Inside `verify_subgraph` | `Send` API spawns parallel claim verifiers; `operator.add` reducer collects results |
 | **ReAct** | `react_researcher` | Model ↔ `ToolNode` loop; exits when model emits no `tool_calls` |
 | **Human-in-the-loop** | `planner` | `interrupt()` pauses graph; resumed with `Command(resume=True/False)` |
 | **Reflection** | `reflection_subgraph` | Critic → Refiner loop until quality criteria are met |
@@ -129,6 +129,10 @@ All agent variables use the `AGENT_` prefix. Defaults work for local development
 | `AGENT_MAX_PIPELINE_STEPS` | `50` | LangGraph `recursion_limit`: total supersteps across the whole pipeline per invocation |
 | `AGENT_GUARD_MODEL` | `fastino/gliguard-LLMGuardrails-300M` | HuggingFace model for GLiGuard (prompt injection, jailbreak, PII) |
 | `AGENT_GUARD_DEVICE` | `cpu` | Inference device for GLiGuard: `cpu`, `cuda`, or `mps` |
+| `AGENT_WEB_SEARCH_MAX_RESULTS` | `10` | Server-side cap on `max_results` for `web_search` and `fact_check` MCP tools |
+| `AGENT_API_KEY` | `None` | X-API-Key header value; when unset, auth is disabled (local dev) |
+| `AGENT_RATE_LIMIT` | `None` | slowapi limit string, e.g. `20/minute`; when unset, rate limiting is disabled |
+| `AGENT_SSE_KEEPALIVE_SECONDS` | `15` | SSE ping interval to prevent proxy idle-timeout on long graph runs |
 | `AGENT_APP_HOST` | `0.0.0.0` | Bind host for the FastAPI app |
 | `AGENT_APP_PORT` | `8000` | Bind port for the FastAPI app |
 | `AGENT_MCP_HOST` | `0.0.0.0` | Bind host for the MCP tool server |
@@ -211,4 +215,8 @@ uv run pytest tests/guards/
 
 # MCP server tools
 uv run pytest tests/mcp/
+
+# Smoke test (requires app + Postgres; LLM-dependent tests auto-skip if unreachable)
+uv run python evals/smoke_test.py
+uv run python evals/smoke_test.py --base-url http://localhost:9000  # custom port
 ```

@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastmcp import Client
 
-from app.mcp.server import _validate_url, fetch_url, mcp, web_search
+from app.mcp.server import fetch_url, mcp, web_search
+from app.mcp.ssrf import _validate_url
 
 
 class TestMcpSchema:

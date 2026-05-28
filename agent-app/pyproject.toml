@@ -22,6 +22,7 @@ dependencies = [
     "logger",
     "langchain-litellm>=0.6.6",
     "gliner2>=1.3",
+    "slowapi>=0.1.9",
 ]
 
 [dependency-groups]
@@ -34,6 +35,7 @@ dev = [
     "pyright>=1.1",
     "ruff",
     "taskipy>=1.14.0",
+    "pip-audit>=2.7",
 ]
 
 [tool.uv.sources]
@@ -71,9 +73,10 @@ venvPath = "."
 venv = ".venv"
 
 [tool.taskipy.tasks]
-precommit = { cmd = "uvx ruff format . && uvx ruff check . --fix --unsafe-fixes && uvx pyright .", help = "Lint, format and typecheck Python codebase" }
+precommit = { cmd = "uvx ruff format . && uvx ruff check . --fix --unsafe-fixes && uvx pyright . && uv run pip-audit", help = "Lint, format, typecheck, and audit dependencies" }
 test = { cmd = "pytest", help = "Run the full test suite in parallel" }
 test-cov = { cmd = "pytest --cov=app --cov-report=term-missing", help = "Run tests with coverage report" }
+audit = { cmd = "pip-audit", help = "Scan dependencies for known CVEs" }
 mcp = { cmd = "uvicorn app.mcp.server:mcp --host 0.0.0.0 --port 8001", help = "Run the MCP tool server" }
 app = { cmd = "uvicorn app.main:app --reload", help = "Run the FastAPI app with auto-reload" }
 

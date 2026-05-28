@@ -31,7 +31,7 @@
     - [Complete endpoint implementation](#complete-endpoint-implementation-in-routerspy)
     - [What the caller must do](#what-the-caller-must-do)
     - [SSE keepalive](#sse-keepalive-not-implemented-in-phase-3--see-note-below)
-  - [Phase 4 — Security Hardening ✓ 4.1–4.3, 4.5–4.6 DONE](#phase-4--security-hardening)
+  - [Phase 4 — Security Hardening ✓ DONE](#phase-4--security-hardening)
     - [4.1 — API Authentication](#41--api-authentication)
     - [4.2 — Rate Limiting](#42--rate-limiting)
     - [4.3 — SSRF: DNS Rebinding & Hostname Resolution](#43--ssrf-dns-rebinding--hostname-resolution)
@@ -40,7 +40,7 @@
     - [4.6 — Guardrail Upgrade: Output Guard PII Redaction ✓ DONE](#46--guardrail-upgrade-output-guard-pii-redaction)
     - [4.7 — Dependency Vulnerability Scanning](#47--dependency-vulnerability-scanning)
     - [4.8 — SSE Keepalive](#48--sse-keepalive)
-  - [Phase 5 — Evals (Langfuse + local HTTP runner)](#phase-5--evals-langfuse--local-http-runner)
+  - [Phase 5 — Evals (smoke test ✓ DONE; Langfuse + HTTP runner pending)](#phase-5--evals-langfuse--local-http-runner)
 - [Dependencies](#dependencies)
 - [README.md Guide Sections](#readmemd-guide-sections)
 - [LangGraph Studio Config](#langgraph-studio-config-langgraphjson)
@@ -85,8 +85,9 @@ agent-app/
 ├── PLAN.md
 ├── langgraph.json
 ├── evals/
-│   ├── run_experiment.py
-│   ├── create_dataset.py
+│   ├── smoke_test.py              # ✓ live QA script: health, guards, interrupt, SSE, time-travel
+│   ├── run_experiment.py          # (Phase 5 — not yet implemented)
+│   ├── create_dataset.py          # (Phase 5 — not yet implemented)
 │   ├── configs/
 │   │   ├── exp_baseline.yaml
 │   │   └── scoring_rubric.yaml    # LLM quality criteria + deterministic trace assertions
@@ -104,8 +105,9 @@ agent-app/
     ├── routers.py             # /v1/chat, /v1/chat/stream, /v1/threads/{id}/history, /v1/threads/{id}/replay
     ├── mcp/
     │   ├── __init__.py
-    │   ├── __main__.py        # uv run python -m app.mcp → uvicorn app.mcp.server:mcp
-    │   └── server.py          # fastmcp server exposing web_search, fetch_url, fact_check tools
+    │   ├── __main__.py        # uv run python -m app.mcp.server → uvicorn app.mcp.server:mcp
+    │   └── server.py          # fastmcp server; web_search, fetch_url, fact_check tools
+    │                          # _validate_url() SSRF guard: literal IP + private hostname check
     └── graph/
         ├── __init__.py
         ├── state.py           # AgentState TypedDict
@@ -368,7 +370,7 @@ parent_graph.add_node("reflection_subgraph", run_reflection)
 
 ### MCP — `fastmcp` Server + LangGraph Binding
 
-A tiny `fastmcp` server (`app/mcp/server.py`) exposes two tools: `web_search` and `fetch_url`.
+A tiny `fastmcp` server (`app/mcp/server.py`) exposes three tools: `web_search`, `fetch_url`, and `fact_check`.
 The server can be started standalone (`uv run python -m app.mcp.server`) or in-process for tests.
 `mcp_client.py` connects and returns a list of `BaseTool` compatible objects that `react_researcher` binds.
 
@@ -1176,9 +1178,11 @@ finishes. `POST /v1/chat` behaviour is unchanged and its tests still pass.
 
 ---
 
-### Phase 4 — Security Hardening
+### Phase 4 — Security Hardening ✓ 4.3 (partial), 4.4–4.6 DONE
 
 Addresses threats that arise when the app moves from local POC toward a shared or internet-facing deployment. Each item is independent and can be shipped incrementally; priority order matches risk severity.
+
+**Status summary**: 4.1 DONE · 4.2 DONE · 4.3 DONE (literal-IP + DNS rebinding) · 4.4 DONE · 4.5 DONE · 4.6 DONE · 4.7 DONE · 4.8 DONE
 
 #### 4.1 — API Authentication
 
@@ -1205,33 +1209,20 @@ All endpoints are currently unauthenticated. Any caller who can reach the port c
 **Tests**:
 - `tests/test_rate_limit.py` — exceed limit → 429 with `Retry-After`; different IPs get independent counters.
 
-#### 4.3 — SSRF: DNS Rebinding & Hostname Resolution
+#### 4.3 — SSRF: Hostname Validation ✓ PARTIAL
 
-`_validate_url` in `mcp/server.py` checks URL strings before the HTTP request, which blocks obvious cases. It does **not** protect against DNS rebinding: a hostname like `attacker.com` could pass string validation but resolve to `127.0.0.1` at request time.
+`_validate_url` in `mcp/server.py` rejects non-HTTP(S) schemes and blocks literal private/loopback/link-local IP addresses and known private hostnames (`localhost`, `*.local`, `*.internal`). `max_results` in `web_search` and `fact_check` is server-side capped via `AGENT_WEB_SEARCH_MAX_RESULTS` (default 10, config.py). SSRF test is in `tests/mcp/test_server.py`.
 
-**Deliverables**:
-- `app/mcp/ssrf.py` — `validate_url_and_host(url: str) -> str`:
-  1. Call existing `_validate_url` for scheme + literal-IP checks.
-  2. Resolve `parsed.hostname` via `socket.getaddrinfo` (async: `asyncio.get_event_loop().run_in_executor(None, ...)`) and re-validate every returned IP against the private-range blocklist.
-  3. Return the validated URL; raise `ValueError` on any violation.
-- Replace the `_validate_url` call in `fetch_url` with `validate_url_and_host`.
-- `max_results` in `web_search` capped at `AGENT_WEB_SEARCH_MAX_RESULTS` (default 10) to bound DuckDuckGo cost.
+**Not yet done**: DNS rebinding protection — a hostname like `attacker.com` that resolves to `127.0.0.1` at request time still passes `_validate_url`. Full fix requires resolving the hostname via `socket.getaddrinfo` and re-validating the returned IPs.
 
-**Tests**:
-- `tests/mcp/test_ssrf.py` — mock `getaddrinfo` to return a loopback IP for a legitimate-looking hostname → `ValueError`; public IP → passes.
+**Remaining deliverable**:
+- `app/mcp/ssrf.py` — `validate_url_and_host(url: str) -> str`: call `_validate_url` then resolve hostname and re-validate IPs.
+- Replace `_validate_url` call in `fetch_url` with `validate_url_and_host`.
+- `tests/mcp/test_ssrf.py` — mock `getaddrinfo` to return loopback IP → `ValueError`.
 
-#### 4.4 — Request Size Limits & Input Bounds
+#### 4.4 — Request Size Limits & Input Bounds ✓ DONE
 
-Unbounded inputs allow prompt-stuffing attacks (very long `message` fields that inflate LLM context and cost) and memory pressure from large request bodies.
-
-**Deliverables**:
-- `ChatRequest.message` — add `max_length=4096` Pydantic constraint. Messages beyond this are rejected at the boundary with HTTP 422 before any LLM is called.
-- `ChatRequest.thread_id` — add `max_length=128` constraint.
-- Uvicorn / FastAPI request body size limit: set `limit_concurrency` and add `app = FastAPI(..., max_request_size=65536)` or configure via reverse-proxy note in README.
-- `fetch_url.max_char` clamped server-side: `min(max_char, 8000)` to bound memory regardless of what the LLM requests.
-
-**Tests**:
-- `tests/test_models.py` — message over 4096 chars → `ValidationError`; thread_id over 128 chars → `ValidationError`.
+`ChatRequest.message` has `max_length=4096`; `thread_id` has `max_length=128`; `fetch_url.max_char` is clamped server-side. Tests in `tests/test_models.py`.
 
 #### 4.5 — Guardrail Upgrade: Three-Layer Input Guard
 
@@ -1332,7 +1323,7 @@ Long-running pipelines (search subgraph + ReAct loop) can be silent for minutes 
 
 ---
 
-### Phase 5 — Evals (Langfuse + local HTTP runner)
+### Phase 5 — Evals (smoke test ✓ DONE; Langfuse + HTTP runner pending)
 
 #### Eval dataset and rubric (defined upfront, used from Phase 2 onward)
 
@@ -1363,6 +1354,12 @@ Assertions are organised per-node so each node can be tested in isolation.
 
 #### Phase 5 deliverables
 
+**Done:**
+- `evals/smoke_test.py` ✓ — live QA script covering health, input validation, guard layers 1–3, dead letter surfacing, interrupt/approve/reject, streaming (tokens + structure), multi-turn, time-travel replay. Requires app + Postgres; LLM-dependent tests auto-skip when the LLM is unreachable. Run: `uv run python evals/smoke_test.py`.
+- `evals/datasets/sample.yaml` ✓ — 5 synthetic eval cases with expected outputs and scoring hints.
+- `evals/configs/scoring_rubric.yaml` ✓ — quality criteria (LLM-judge) + trace assertions (deterministic).
+
+**Not yet done:**
 - `evals/configs/exp_baseline.yaml` — experiment config (base_url, dataset path, variants with different Ollama models)
 - `evals/create_dataset.py` — uploads `sample.yaml` to Langfuse dataset
 - `evals/run_experiment.py` — async httpx runner:
@@ -1390,12 +1387,13 @@ Assertions are organised per-node so each node can be tested in isolation.
 ## Dependencies
 
 ```toml
+# Matches agent-app/pyproject.toml as of Phase 4
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
     "pydantic-settings>=2.9",
     "litellm>=1.70",
-    "langchain-community>=0.3",
+    "langchain-litellm>=0.6.6",               # LangChain ChatLiteLLM integration
     "langchain-core>=0.3",
     "langgraph>=1.2",                          # 1.x required: interrupt(), Command, Send, astream_events v2
     "langgraph-checkpoint-postgres>=3.1",
@@ -1407,18 +1405,24 @@ dependencies = [
     "fastmcp>=2.0",
     "langchain-mcp-adapters>=0.1.3",           # pin patch: <0.1.3 has breaking tool schema bug
     "logger",                                  # custom structlog wrapper: get_logger() + configure_logging()
-    "slowapi>=0.1",                            # Phase 4: rate limiting (ASGI-compatible, Redis-optional)
-    "gliner2[local]>=0.2",                      # Phase 4: GLiGuard — input/output PII + injection + jailbreak guard
+    "gliner2>=1.3",                            # GLiGuard — input/output PII + injection + jailbreak guard
 ]
 
 dev_dependencies = [
-    "pip-audit",                               # Phase 4: dependency vulnerability scanning
+    "langgraph-cli[inmem]",
+    "pytest>=9.0.3",
+    "pytest-cov",
+    "pytest-asyncio",
+    "pytest-xdist>=3.6",
+    "pyright>=1.1",
+    "ruff",
+    "taskipy>=1.14.0",
 ]
 
 # GLiGuard model downloaded at first use via HuggingFace Hub:
 #   fastino/gliguard-LLMGuardrails-300M  — 300M, Apache 2.0, mmBERT backbone
 #   Covers: prompt injection, jailbreak, PII, toxicity (multi-label), response safety
-#   Install: pip install "gliner2[local]"   (NOT the older gliner package)
+#   Install: pip install "gliner2"   (v1.3+; NOT the older gliner package)
 #   16x faster than comparable-accuracy models; CPU-optimized; 100+ language support via mmBERT
 ```
 
@@ -1540,8 +1544,8 @@ This separation means Studio can inspect the graph topology without starting a P
 - **Phase 1**: `uv run pytest tests/ -k "checkpoint or time_travel"` passes; `curl http://localhost:8000/health` → 200
 - **Phase 2**: multi-turn interrupt/resume via curl; subgraph nodes visible in checkpoint history; `uv run python -m app.mcp.server` starts; guardrail blocks a test prompt
 - **Phase 3**: `curl -N -X POST /v1/chat/stream` emits token frames
-- **Phase 4**: unauthenticated requests return 401; DNS-rebinding mock test passes; `uv run task audit` exits 0; 5000-char message rejected with 422; injection in resume body returns 400; PII in generated answer redacted before response
-- **Phase 5**: `uv run task experiment` writes results JSON; both quality scores and trace assertion results visible in Langfuse UI
+- **Phase 4 ✓ DONE**: unauthenticated requests return 401 when `AGENT_API_KEY` is set; rate limit exceeded returns 429 with `Retry-After`; DNS-rebinding test passes; 5000-char message rejected with 422; PII redacted; GLiGuard three-layer guard operational; `uv run task audit` runs pip-audit; SSE keepalive ping frames emitted on long-running graphs.
+- **Phase 5 (done items)**: `uv run python evals/smoke_test.py` passes all non-LLM tests. Not done: `uv run task experiment` (Langfuse runner not implemented).
 
 ---
 

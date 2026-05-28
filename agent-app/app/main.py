@@ -19,20 +19,32 @@ Quick start:
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from logger import configure_logging, get_logger
+from slowapi.errors import RateLimitExceeded
 
+from app.auth import verify_api_key
 from app.config import settings
 from app.graph.mcp_client import load_mcp_tools
 from app.graph.nodes._llm_invoke import NodeLLMConfig
 from app.graph.workflow import compile_graph
 from app.guards.gliguard import GLiGuardClient
-from app.routers import router
+from app.rate_limit import limiter
+from app.routers import health_router, router
 
 configure_logging()
 logger = get_logger(__name__)
+
+
+async def _rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    response = JSONResponse(
+        {"detail": f"Rate limit exceeded: {exc.detail}"},
+        status_code=429,
+    )
+    response.headers["Retry-After"] = str(60)
+    return response
 
 
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -80,5 +92,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.include_router(router)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+
+# /health is unauthenticated so liveness probes work without credentials.
+app.include_router(health_router)
+# All v1 endpoints require API key authentication when AGENT_API_KEY is set.
+app.include_router(router, dependencies=[Depends(verify_api_key)])
 app.add_exception_handler(Exception, _unhandled_exception_handler)

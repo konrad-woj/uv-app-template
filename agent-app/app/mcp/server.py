@@ -13,46 +13,15 @@ Tools exposed:
 """
 
 import asyncio
-import ipaddress
-from urllib.parse import urlparse
 
 import httpx
 from duckduckgo_search import DDGS
 from fastmcp import FastMCP
 
 from app.config import settings
+from app.mcp.ssrf import validate_url_and_host
 
 mcp = FastMCP("research-tools")
-
-_ALLOWED_SCHEMES = {"http", "https"}
-
-
-def _validate_url(url: str) -> None:
-    """Reject non-HTTP(S) schemes and private/loopback/link-local hosts.
-
-    Prevents SSRF: the LLM can be prompt-injected via search results to call
-    fetch_url with internal addresses (e.g. 169.254.169.254 AWS metadata).
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in _ALLOWED_SCHEMES:
-        raise ValueError(f"Disallowed URL scheme: {parsed.scheme!r}")
-    host = parsed.hostname or ""
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        # Not an IP literal — check private hostname patterns
-        if host == "localhost" or host.endswith(".local") or host.endswith(".internal"):
-            raise ValueError(f"Blocked private hostname: {host}")  # noqa: B904
-        return
-    if (
-        not addr.is_global
-        or addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-    ):
-        raise ValueError(f"Blocked non-public IP: {host}")
 
 
 @mcp.tool()
@@ -79,7 +48,7 @@ async def fetch_url(url: str, max_char: int = 4000, timeout: float = 15.0) -> st
         max_char: The maximum number of characters to fetch.
         timeout: The timeout in seconds.
     """
-    _validate_url(url)
+    validate_url_and_host(url)
     async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
         response = await client.get(url)
         response.raise_for_status()
@@ -104,7 +73,7 @@ async def fact_check(claim: str) -> str:
     extra = ""
     if top_url:
         try:
-            _validate_url(top_url)
+            validate_url_and_host(top_url)
             async with httpx.AsyncClient(follow_redirects=False, timeout=10.0) as client:
                 resp = await client.get(top_url)
                 resp.raise_for_status()

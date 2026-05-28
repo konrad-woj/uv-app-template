@@ -15,9 +15,10 @@ from langgraph.types import Command
 
 from app.dependencies import get_graph
 from app.exceptions import LLMRateLimitError
-from app.routers import _classify_error, _generate, router
+from app.routers import _classify_error, _generate, health_router, router
 
 _app = FastAPI()
+_app.include_router(health_router)
 _app.include_router(router)
 
 

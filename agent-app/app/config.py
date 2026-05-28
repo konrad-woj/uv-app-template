@@ -95,6 +95,26 @@ class Settings(BaseSettings):
         default="cpu",
         description="Device for GLiGuard inference: 'cpu', 'cuda', or 'mps'.",
     )
+    api_key: str | None = Field(
+        default=None,
+        description=(
+            "API key for X-API-Key header authentication. When unset, all requests are allowed (local dev / tests)."
+        ),
+    )
+    rate_limit: str | None = Field(
+        default=None,
+        description=(
+            "slowapi rate limit string applied to graph-invoking endpoints, e.g. '20/minute'. "
+            "When unset, rate limiting is disabled."
+        ),
+    )
+    sse_keepalive_seconds: int = Field(
+        default=15,
+        description=(
+            "Interval in seconds between SSE keepalive ping frames. "
+            "Prevents reverse proxies from closing idle connections during long graph runs."
+        ),
+    )
     app_host: str = Field(default="0.0.0.0", description="Bind host for the FastAPI app.")
     app_port: int = Field(default=8000, description="Bind port for the FastAPI app.")
     mcp_host: str = Field(default="0.0.0.0", description="Bind host for the MCP tool server.")
