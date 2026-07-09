@@ -67,6 +67,10 @@ class Settings(BaseSettings):
         default="http://localhost:8001/mcp",
         description="URL of the fastmcp tool server (streamable-http endpoint).",
     )
+    mcp_connect_timeout_seconds: float = Field(
+        default=10.0,
+        description="Per-attempt timeout in seconds for connecting to the MCP server and listing tools.",
+    )
     max_reflection_attempts: int = Field(
         default=5,
         description="Hard ceiling on reflection critic/refiner iterations. Loop exits on quality pass or when this limit is reached.",

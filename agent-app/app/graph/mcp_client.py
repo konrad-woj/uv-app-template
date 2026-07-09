@@ -18,6 +18,8 @@ from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from logger import get_logger
 
+from app.config import settings
+
 logger = get_logger(__name__)
 
 
@@ -25,7 +27,9 @@ async def load_mcp_tools(server_url: str, retries: int = 5, delay: float = 2.0) 
     """Connect to the MCP server and return all exposed tools as LangChain BaseTool instances.
 
     Retries up to `retries` times with `delay` seconds between attempts to handle
-    race conditions when the MCP server process is still starting.
+    race conditions when the MCP server process is still starting. Each attempt
+    is bounded by settings.mcp_connect_timeout_seconds so a hung connection can't
+    stall app startup indefinitely.
 
     Args:
         server_url: Base URL of the fastmcp server (e.g. "http://localhost:8001").
@@ -36,7 +40,7 @@ async def load_mcp_tools(server_url: str, retries: int = 5, delay: float = 2.0) 
     for attempt in range(max(retries, 0)):
         try:
             client = MultiServerMCPClient({"research": {"url": server_url, "transport": "streamable_http"}})
-            return await client.get_tools()
+            return await asyncio.wait_for(client.get_tools(), timeout=settings.mcp_connect_timeout_seconds)
         except Exception as exc:
             last_exc = exc
             if attempt < retries - 1:
