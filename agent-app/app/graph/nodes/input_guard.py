@@ -15,6 +15,7 @@ On block:  sets status="blocked", guard_reason=<reason>, routes to END.
 On error:  with_dead_letter catches the exception and routes to dead_letter.
 """
 
+import asyncio
 from collections.abc import Callable
 
 from langchain_core.language_models import BaseChatModel
@@ -68,7 +69,7 @@ def make_input_guard_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Calla
         logger.info("input_guard.layer1_passed")
 
         # Layer 2: GLiGuard — injection and jailbreak detection.
-        guard_result = gliguard.check_input(user_text)
+        guard_result = await asyncio.to_thread(gliguard.check_input, user_text)
         if guard_result.blocked:
             logger.info("input_guard.layer2_blocked", reason=guard_result.reason)
             return {"status": "blocked", "guard_reason": guard_result.reason or "Potential prompt injection detected."}
