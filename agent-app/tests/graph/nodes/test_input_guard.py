@@ -21,7 +21,7 @@ class TestInputGuardLayerOne:
 
         assert result["status"] == "blocked"
         assert "sanitiser" in result["guard_reason"].lower()
-        gliguard.check_input.assert_not_called()
+        gliguard.acheck_input.assert_not_called()
         llm.ainvoke.assert_not_called()
 
     async def test_xml_injection_blocked_before_gliguard(self) -> None:
@@ -34,7 +34,7 @@ class TestInputGuardLayerOne:
         result = await node(state, CONFIG)
 
         assert result["status"] == "blocked"
-        gliguard.check_input.assert_not_called()
+        gliguard.acheck_input.assert_not_called()
 
 
 class TestInputGuardLayerTwo:

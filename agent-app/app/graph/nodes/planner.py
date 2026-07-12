@@ -1,16 +1,25 @@
-"""Planner node: generates a research plan, guards it, then pauses for human approval.
+"""Planner + plan_review nodes: generate a research plan, then pause for human approval.
+
+Split into two nodes because LangGraph re-executes a node's entire function body
+from the top on every resume — only the *return value* is checkpointed, not
+progress within the function. A single node that generates the plan and then
+calls interrupt() would regenerate the plan (a fresh, nondeterministic LLM call)
+every time the graph resumes, so the plan the user approved in the interrupt
+payload could differ from the plan actually used afterward. Splitting avoids
+that: all nondeterministic work happens in `planner`, which returns before any
+interrupt; `plan_review` does nothing but read the already-computed plan from
+state and call interrupt() — safe to re-run on resume since it has no side effects.
 
 Demonstrates the LangGraph interrupt() pattern:
-  1. LLM generates a plan.
-  2. Plan text is checked by GLiGuard (injection/content check) + LLM quality check.
-     If the plan is unsafe: returns status="blocked" WITHOUT calling interrupt() —
-     the unsafe plan is never surfaced to the user.
-  3. If the plan is safe: calls interrupt({"plan": plan_steps}) — graph suspends here,
-     checkpointed. Resume guard and search run on resumption.
-  4. Caller resumes with Command(resume=True) → plan_approved=True → routes to resume_guard.
-  5. Caller resumes with Command(resume=False) → plan_approved=False → routes to END (aborted).
+  1. planner: LLM generates a plan, then GLiGuard (injection/content check) + LLM
+     quality check guard it. If unsafe: returns status="blocked" WITHOUT calling
+     interrupt() — the unsafe plan is never surfaced to the user.
+  2. plan_review: if the plan was safe, calls interrupt({"plan": plan}) — graph
+     suspends here, checkpointed. Resume guard and search run on resumption.
+  3. Caller resumes with Command(resume=True) → plan_approved=True → routes to resume_guard.
+  4. Caller resumes with Command(resume=False) → plan_approved=False → routes to END (aborted).
 
-The planner is wrapped with with_dead_letter so any LLM error routes to dead_letter.
+Both nodes are wrapped with with_dead_letter so any error routes to dead_letter.
 """
 
 from collections.abc import Callable
@@ -22,6 +31,7 @@ from langgraph.types import interrupt
 from logger import get_logger
 from pydantic import ValidationError
 
+from app.config import settings
 from app.graph.nodes._dead_letter import with_dead_letter
 from app.graph.nodes._guard_verdict import GuardVerdict
 from app.graph.nodes._llm_invoke import llm_invoke_with_retry
@@ -70,7 +80,7 @@ def make_planner_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Callable:
         plan_as_text = "\n".join(plan_steps)
 
         # GLiGuard injection check on plan text.
-        guard_result = gliguard.check_input(plan_as_text)
+        guard_result = await gliguard.acheck_input(plan_as_text, settings.guard_timeout_seconds)
         if guard_result.blocked:
             logger.info("planner.guard_gliguard_blocked", reason=guard_result.reason)
             return {
@@ -104,12 +114,27 @@ def make_planner_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Callable:
             }
 
         logger.info("planner.guard_passed", awaiting_approval=True)
-        # Plan is safe — pause here for human approval.
-        approved: bool = interrupt({"plan": plan_steps})
-
-        logger.info("planner.resumed", approved=approved)
-        if not approved:
-            return {"plan": plan_steps, "plan_approved": False, "status": "aborted"}
-        return {"plan": plan_steps, "plan_approved": True, "status": "researching"}
+        return {"plan": plan_steps, "status": "awaiting_approval"}
 
     return planner
+
+
+def make_plan_review_node() -> Callable:
+    """Return an async node that pauses for human approval of an already-guarded plan.
+
+    Reads ``plan`` from state (written by ``planner``) and does nothing else
+    before calling interrupt() — safe to re-run from the top on resume.
+    """
+
+    @with_dead_letter("plan_review")
+    async def plan_review(state: "AgentState", config: RunnableConfig) -> dict:  # type: ignore[name-defined]  # noqa: F821
+        _ = config
+        plan_steps = state.get("plan", [])
+        approved: bool = interrupt({"plan": plan_steps})
+
+        logger.info("plan_review.resumed", approved=approved)
+        if not approved:
+            return {"plan_approved": False, "status": "aborted"}
+        return {"plan_approved": True, "status": "researching"}
+
+    return plan_review

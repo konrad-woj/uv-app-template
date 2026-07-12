@@ -1,6 +1,6 @@
 """Tests for output_guard node: PII redaction + deterministic verification check."""
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.graph.nodes.output_guard import make_output_guard_node
 from app.guards.gliguard import GuardResult, Span
@@ -13,7 +13,7 @@ class TestOutputGuardPIIRedaction:
     async def test_email_in_answer_is_redacted(self) -> None:
         email_span = Span(text="user@example.com", entity_type="email", start=12, end=28)
         gliguard = MagicMock()
-        gliguard.check_output.return_value = GuardResult(blocked=False, flagged_spans=[email_span])
+        gliguard.acheck_output = AsyncMock(return_value=GuardResult(blocked=False, flagged_spans=[email_span]))
         node = make_output_guard_node(gliguard)
 
         state = base_state(
@@ -40,7 +40,7 @@ class TestOutputGuardPIIRedaction:
         """Redacted answer is what gets returned and passed through verification."""
         phone_span = Span(text="555-1234", entity_type="phone number", start=6, end=14)
         gliguard = MagicMock()
-        gliguard.check_output.return_value = GuardResult(blocked=False, flagged_spans=[phone_span])
+        gliguard.acheck_output = AsyncMock(return_value=GuardResult(blocked=False, flagged_spans=[phone_span]))
         node = make_output_guard_node(gliguard)
 
         state = base_state(final_answer="Call: 555-1234 for info.")

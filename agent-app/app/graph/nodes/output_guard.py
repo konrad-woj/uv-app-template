@@ -14,12 +14,12 @@ On blocked: sets status="blocked", replaces final_answer with safe fallback mess
 On error:   with_dead_letter catches and routes to dead_letter.
 """
 
-import asyncio
 from collections.abc import Callable
 
 from langchain_core.runnables import RunnableConfig
 from logger import get_logger
 
+from app.config import settings
 from app.graph.nodes._dead_letter import with_dead_letter
 from app.guards.gliguard import GLiGuardClient, redact
 
@@ -46,7 +46,7 @@ def make_output_guard_node(gliguard: GLiGuardClient) -> Callable:
         )
 
         # Layer 1: GLiGuard PII detection and in-place redaction.
-        pii_result = await asyncio.to_thread(gliguard.check_output, answer)
+        pii_result = await gliguard.acheck_output(answer, settings.guard_timeout_seconds)
         if pii_result.flagged_spans:
             logger.info("output_guard.pii_redacted", span_count=len(pii_result.flagged_spans))
             answer = redact(answer, pii_result.flagged_spans)

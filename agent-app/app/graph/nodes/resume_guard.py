@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from logger import get_logger
 
+from app.config import settings
 from app.graph.nodes._dead_letter import with_dead_letter
 from app.graph.nodes._prompt_utils import sanitize_user_text
 from app.guards.gliguard import GLiGuardClient
@@ -47,7 +48,7 @@ def make_resume_guard_node(gliguard: GLiGuardClient) -> Callable:
         logger.info("resume_guard.layer1_passed")
 
         # Layer 2: GLiGuard injection/jailbreak check.
-        guard_result = gliguard.check_input(clean_text)
+        guard_result = await gliguard.acheck_input(clean_text, settings.guard_timeout_seconds)
         if guard_result.blocked:
             logger.info("resume_guard.layer2_blocked", reason=guard_result.reason)
             return {

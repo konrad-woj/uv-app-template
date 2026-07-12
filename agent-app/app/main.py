@@ -1,8 +1,8 @@
 """Agent App — FastAPI entry point.
 
 Lifecycle:
-  startup  → load MCP tools, create AsyncPostgresSaver, load GLiGuardClient, compile graph.
-  shutdown → checkpointer connection pool is closed via async context manager.
+  startup  → load MCP tools, open a pooled AsyncPostgresSaver, load GLiGuardClient, compile graph.
+  shutdown → connection pool is closed via async context manager.
 
 The compiled graph is stored on app.state.graph and injected into endpoints
 via the get_graph() dependency (app/dependencies.py).
@@ -23,6 +23,9 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from logger import configure_logging, get_logger
+from psycopg import AsyncConnection
+from psycopg.rows import DictRow, dict_row
+from psycopg_pool import AsyncConnectionPool
 from slowapi.errors import RateLimitExceeded
 
 from app.auth import verify_api_key
@@ -59,7 +62,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     mcp_tools = await load_mcp_tools(settings.mcp_server_url)
     logger.info("MCP tools loaded", tool_count=len(mcp_tools))
 
-    gliguard = GLiGuardClient(settings.guard_model, settings.guard_device)
+    gliguard = GLiGuardClient(settings.guard_model, settings.guard_device, settings.guard_max_concurrency)
     gliguard.load()
     app.state.gliguard = gliguard
     logger.info("GLiGuard loaded", model=settings.guard_model, device=settings.guard_device)
@@ -73,8 +76,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         "output_guard": NodeLLMConfig(temperature=0.0),
     }
 
-    async with AsyncPostgresSaver.from_conn_string(settings.db_uri) as checkpointer:
-        await checkpointer.setup()
+    async with AsyncConnectionPool(
+        conninfo=settings.db_uri,
+        max_size=settings.db_pool_max_size,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+        connection_class=AsyncConnection[DictRow],
+    ) as pool:
+        checkpointer = AsyncPostgresSaver(pool)
+        await checkpointer.setup()  # idempotent; safe to run on every startup
+        app.state.checkpointer = checkpointer  # exposed so /ready can probe DB connectivity directly
+        app.state.mcp_tool_count = len(mcp_tools)  # count only; tools themselves stay closed over by the graph
         app.state.graph = compile_graph(checkpointer, mcp_tools, gliguard, node_llm_configs)
         logger.info("Graph compiled and ready")
         yield

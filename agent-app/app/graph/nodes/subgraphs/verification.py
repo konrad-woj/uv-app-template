@@ -17,6 +17,7 @@ The subgraph is invoked from the parent graph via a wrapper node
 (``_make_run_verification``) in workflow.py that maps AgentState ↔ VerificationState.
 """
 
+import asyncio
 import operator
 from collections.abc import Callable
 from typing import Annotated, TypedDict
@@ -31,6 +32,7 @@ from langgraph.types import Send
 from logger import get_logger
 from pydantic import BaseModel, ValidationError, field_validator
 
+from app.config import settings
 from app.graph.nodes._llm_invoke import llm_invoke_with_retry
 
 logger = get_logger(__name__)
@@ -66,9 +68,15 @@ def make_verifier_node(llm: BaseChatModel, fact_check_tool: BaseTool | None) -> 
         claim = state["claim"]
         logger.info("verifier.start", claim_length=len(claim))
 
-        # Step 1: tool call — gather evidence.
+        # Step 1: tool call — gather evidence. Bounded by a timeout like every LLM
+        # call in this codebase; a hung or failing MCP call raises here instead of
+        # blocking the branch indefinitely, so the wrapper node's dead-letter
+        # handling in workflow.py can catch it.
         if fact_check_tool is not None:
-            evidence = await fact_check_tool.ainvoke({"claim": claim})
+            evidence = await asyncio.wait_for(
+                fact_check_tool.ainvoke({"claim": claim}),
+                timeout=settings.mcp_tool_call_timeout_seconds,
+            )
         else:
             evidence = "Verification skipped — no fact_check tool available."
 

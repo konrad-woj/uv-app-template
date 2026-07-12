@@ -5,7 +5,7 @@ Exposes two functions:
   compile_graph()  — compiles with checkpointer + LLM + MCP tools (main.py lifespan).
 
 Full graph:
-  START → input_guard → planner (interrupt) → resume_guard → react_researcher
+  START → input_guard → planner → plan_review (interrupt) → resume_guard → react_researcher
         → writer → verify_subgraph → reflection_subgraph → output_guard → END
 
 Dead-letter routing: every node that can raise is wrapped with @with_dead_letter.
@@ -29,11 +29,11 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from app.config import settings
-from app.graph.nodes._dead_letter import after, dead_letter_node
+from app.graph.nodes._dead_letter import after, dead_letter_node, with_dead_letter
 from app.graph.nodes._llm_invoke import NodeLLMConfig, build_llm
 from app.graph.nodes.input_guard import make_input_guard_node
 from app.graph.nodes.output_guard import make_output_guard_node
-from app.graph.nodes.planner import make_planner_node
+from app.graph.nodes.planner import make_plan_review_node, make_planner_node
 from app.graph.nodes.react_researcher import make_react_researcher_node_from_llm
 from app.graph.nodes.resume_guard import make_resume_guard_node
 from app.graph.nodes.subgraphs.reflection import ReflectionState, build_reflection_subgraph
@@ -56,6 +56,12 @@ class _NullGuard:
 
         return GuardResult(blocked=False)
 
+    async def acheck_input(self, text: str, timeout: float):  # type: ignore[return]
+        return self.check_input(text)
+
+    async def acheck_output(self, text: str, timeout: float):  # type: ignore[return]
+        return self.check_output(text)
+
 
 def _react_condition(state: AgentState) -> Literal["tools", "writer"]:
     """Route after react_researcher: loop back to tools or proceed to writer.
@@ -75,13 +81,18 @@ def _input_guard_condition(state: AgentState) -> Literal["planner", "dead_letter
     return "__end__" if state.get("status") == "blocked" else "planner"
 
 
-def _planner_condition(state: AgentState) -> Literal["resume_guard", "dead_letter", "__end__"]:
-    """Route after planner: exception → dead_letter, aborted/blocked → END, approved → resume_guard."""
+def _planner_condition(state: AgentState) -> Literal["plan_review", "dead_letter", "__end__"]:
+    """Route after planner: exception → dead_letter, blocked → END, safe → plan_review."""
     if state.get("dead_letter"):
         return "dead_letter"
-    if state.get("status") in ("aborted", "blocked"):
-        return "__end__"
-    return "resume_guard"
+    return "__end__" if state.get("status") == "blocked" else "plan_review"
+
+
+def _plan_review_condition(state: AgentState) -> Literal["resume_guard", "dead_letter", "__end__"]:
+    """Route after plan_review: exception → dead_letter, aborted → END, approved → resume_guard."""
+    if state.get("dead_letter"):
+        return "dead_letter"
+    return "__end__" if state.get("status") == "aborted" else "resume_guard"
 
 
 def _resume_guard_condition(state: AgentState) -> Literal["react_researcher", "dead_letter", "__end__"]:
@@ -95,6 +106,7 @@ def _make_run_verification(llm: BaseChatModel, fact_check_tool: BaseTool | None)
     """Return a wrapper node that maps AgentState → VerificationState → AgentState."""
     compiled = build_verify_subgraph(llm, fact_check_tool)
 
+    @with_dead_letter("verify_subgraph")
     async def run_verification(state: AgentState, config: RunnableConfig) -> dict:
         verification_input: VerificationState = {
             "claims": state.get("claims", []),  # type: ignore[arg-type]
@@ -111,6 +123,7 @@ def _make_run_reflection(llm: BaseChatModel) -> Callable:
     """Return a wrapper node that maps AgentState → ReflectionState → AgentState."""
     compiled = build_reflection_subgraph(llm)
 
+    @with_dead_letter("reflection_subgraph")
     async def run_reflection(state: AgentState, config: RunnableConfig) -> dict:
         reflection_input: ReflectionState = {
             "draft": state.get("draft_answer", ""),
@@ -142,6 +155,7 @@ def _build_graph(
     # Nodes — each falls back to default_llm when not overridden
     graph.add_node("input_guard", make_input_guard_node(nlm.get("input_guard", default_llm), gliguard))  # type: ignore[arg-type]
     graph.add_node("planner", make_planner_node(nlm.get("planner", default_llm), gliguard))  # type: ignore[arg-type]
+    graph.add_node("plan_review", make_plan_review_node())
     graph.add_node("resume_guard", make_resume_guard_node(gliguard))  # type: ignore[arg-type]
     graph.add_node(
         "react_researcher", make_react_researcher_node_from_llm(nlm.get("react_researcher", default_llm), mcp_tools)
@@ -160,6 +174,7 @@ def _build_graph(
     graph.add_edge(START, "input_guard")
     graph.add_conditional_edges("input_guard", _input_guard_condition)
     graph.add_conditional_edges("planner", _planner_condition)
+    graph.add_conditional_edges("plan_review", _plan_review_condition)
     graph.add_conditional_edges("resume_guard", _resume_guard_condition)
     graph.add_conditional_edges("react_researcher", _react_condition)
     graph.add_edge("tools", "react_researcher")

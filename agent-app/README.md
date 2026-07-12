@@ -11,7 +11,7 @@ Each node in the graph is a vehicle for exactly one LangGraph or agentic pattern
 | **Subgraph** | `verify_subgraph`, `reflection_subgraph` | Compiled `StateGraph` added as a single node via wrapper |
 | **Fan-out / Fan-in** | Inside `verify_subgraph` | `Send` API spawns parallel claim verifiers; `operator.add` reducer collects results |
 | **ReAct** | `react_researcher` | Model ↔ `ToolNode` loop; exits when model emits no `tool_calls` |
-| **Human-in-the-loop** | `planner` | `interrupt()` pauses graph; resumed with `Command(resume=True/False)` |
+| **Human-in-the-loop** | `plan_review` (plan generated + guarded by `planner`) | `interrupt()` pauses graph; resumed with `Command(resume=True/False)` |
 | **Reflection** | `reflection_subgraph` | Critic → Refiner loop until quality criteria are met |
 | **MCP** | `react_researcher` (consumer) + `app/mcp/server.py` (server) | `fastmcp` exposes tools; `langchain-mcp-adapters` binds them to LangGraph |
 | **Guardrails** | `input_guard`, `resume_guard`, `output_guard` | Three-layer input check (regex → GLiGuard → LLM topic); resume message checked by dedicated node; two-layer output check (GLiGuard PII redaction → LLM grounding) |
@@ -30,6 +30,9 @@ All limits are configurable via `AGENT_` env vars.
 | LLM timeout | `AGENT_LLM_TIMEOUT_SECONDS` | `60` | Single LLM call blocking the event loop indefinitely |
 | Retry with backoff | `AGENT_LLM_MAX_RETRIES` | `3` | Transient rate-limit / 5xx errors surfacing as failures immediately |
 | Global pipeline cap | `AGENT_MAX_PIPELINE_STEPS` | `50` | Routing bugs or unexpected loops consuming unbounded supersteps (`GraphRecursionError` on breach) |
+| MCP tool call timeout | `AGENT_MCP_TOOL_CALL_TIMEOUT_SECONDS` | `30` | A hung/slow MCP tool call (e.g. `fact_check` in `verify_subgraph`) blocking a branch indefinitely instead of routing to `dead_letter` |
+| GLiGuard concurrency cap | `AGENT_GUARD_MAX_CONCURRENCY` | `4` | Unbounded concurrent forward passes through the single shared GLiGuard model exhausting host RAM or GPU VRAM under concurrent requests |
+| Postgres connection pool | `AGENT_DB_POOL_MAX_SIZE` | `20` | Concurrent requests serializing through a single checkpointer DB connection |
 
 ## Prerequisites
 
@@ -117,6 +120,7 @@ All agent variables use the `AGENT_` prefix. Defaults work for local development
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_DB_URI` | `postgresql://postgres:postgres@localhost:5433/langgraph` | Postgres connection string |
+| `AGENT_DB_POOL_MAX_SIZE` | `20` | Max connections in the checkpointer's AsyncConnectionPool |
 | `AGENT_LLM_MODEL` | `openai/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit` | LiteLLM model identifier |
 | `AGENT_LLM_BASE_URL` | `http://127.0.0.1:8888/v1` | LLM provider base URL (Unsloth Studio) |
 | `AGENT_LLM_API_KEY` | `None` | API key for the LLM provider (any OpenAI-compatible backend) |
@@ -124,11 +128,16 @@ All agent variables use the `AGENT_` prefix. Defaults work for local development
 | `AGENT_LLM_TIMEOUT_SECONDS` | `60` | Per-call LLM timeout in seconds |
 | `AGENT_LLM_MAX_RETRIES` | `3` | Retries for transient LLM errors (exponential backoff) |
 | `AGENT_MCP_SERVER_URL` | `http://localhost:8001/mcp` | MCP tool server URL |
+| `AGENT_MCP_CONNECT_TIMEOUT_SECONDS` | `10` | Per-attempt timeout for connecting to the MCP server and listing tools |
+| `AGENT_MCP_TOOL_CALL_TIMEOUT_SECONDS` | `30` | Per-call timeout for invoking an MCP tool (e.g. `fact_check`) from within a node |
 | `AGENT_MAX_REFLECTION_ATTEMPTS` | `5` | Hard ceiling on reflection critic/refiner iterations |
 | `AGENT_MAX_REACT_STEPS` | `10` | Hard ceiling on ReAct tool-call iterations |
 | `AGENT_MAX_PIPELINE_STEPS` | `50` | LangGraph `recursion_limit`: total supersteps across the whole pipeline per invocation |
 | `AGENT_GUARD_MODEL` | `fastino/gliguard-LLMGuardrails-300M` | HuggingFace model for GLiGuard (prompt injection, jailbreak, PII) |
 | `AGENT_GUARD_DEVICE` | `cpu` | Inference device for GLiGuard: `cpu`, `cuda`, or `mps` |
+| `AGENT_GUARD_TIMEOUT_SECONDS` | `10` | Per-call timeout for GLiGuard classification calls |
+| `AGENT_GUARD_MAX_CONCURRENCY` | `4` | Max concurrent GLiGuard inference calls; excess calls queue on a semaphore |
+| `AGENT_READINESS_CHECK_TIMEOUT_SECONDS` | `3` | Timeout for the `/ready` endpoint's database connectivity check |
 | `AGENT_WEB_SEARCH_MAX_RESULTS` | `10` | Server-side cap on `max_results` for `web_search` and `fact_check` MCP tools |
 | `AGENT_API_KEY` | `None` | X-API-Key header value; when unset, auth is disabled (local dev) |
 | `AGENT_RATE_LIMIT` | `None` | slowapi limit string, e.g. `20/minute`; when unset, rate limiting is disabled |
@@ -216,7 +225,17 @@ uv run pytest tests/guards/
 # MCP server tools
 uv run pytest tests/mcp/
 
+# Node-level evals (Phase 5a) — one node factory at a time, no server/Postgres/MCP needed
+uv run pytest tests/evals/test_node_tasks.py
+
+# Eval harness unit tests (Phase 5d) — trace assertions, evaluators, dataset validation; zero network calls
+uv run pytest tests/evals/test_trace_assertions.py tests/evals/test_evaluators.py tests/evals/test_dataset_validation.py
+
 # Smoke test (requires app + Postgres; LLM-dependent tests auto-skip if unreachable)
 uv run python evals/smoke_test.py
 uv run python evals/smoke_test.py --base-url http://localhost:9000  # custom port
+
+# HTTP-driven experiment (Phase 5d; requires a running app + Postgres; Langfuse upload is optional)
+uv run task experiment
+uv run python evals/run_experiment.py evals/configs/exp_baseline.yaml
 ```

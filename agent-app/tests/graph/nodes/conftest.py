@@ -69,6 +69,10 @@ def make_mock_gliguard(
     guard = MagicMock(spec=GLiGuardClient)
     guard.check_input.return_value = GuardResult(blocked=blocked, reason=reason, flagged_spans=flagged_spans or [])
     guard.check_output.return_value = GuardResult(blocked=False, flagged_spans=flagged_spans or [])
+    guard.acheck_input = AsyncMock(
+        return_value=GuardResult(blocked=blocked, reason=reason, flagged_spans=flagged_spans or [])
+    )
+    guard.acheck_output = AsyncMock(return_value=GuardResult(blocked=False, flagged_spans=flagged_spans or []))
     return guard
 
 

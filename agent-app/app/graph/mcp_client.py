@@ -2,7 +2,11 @@
 
 Tools are loaded once at app startup in lifespan() and injected into the
 react_researcher node via compile_graph(). This avoids reconnecting on every
-node invocation and keeps the MCP connection alive for the app's lifetime.
+node invocation just to *discover* tools. It does NOT mean a single MCP
+connection is held open for the app's lifetime: MultiServerMCPClient.get_tools()
+opens a new session per tool call under the hood ("A new session will be
+created for each tool call" per its own docstring), so each tool invocation
+still pays its own connection cost regardless of when the tools were loaded.
 
 Note: MultiServerMCPClient does NOT support async context manager as of 0.1.x.
 Instantiate directly and await get_tools() — do not use async with.

@@ -12,3 +12,7 @@ class LLMServiceUnavailableError(LLMError):
 
 class LLMServiceError(LLMError):
     """Raised for unexpected LLM provider errors (5xx other than 503)."""
+
+
+class GuardTimeoutError(Exception):
+    """Raised when a GLiGuard classification call exceeds its timeout."""

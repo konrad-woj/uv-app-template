@@ -22,6 +22,9 @@ from app.config import settings
 from app.mcp.ssrf import validate_url_and_host
 
 mcp = FastMCP("research-tools")
+# Shared client so fetch_url/fact_check reuse one connection pool instead of
+# paying a fresh TCP/TLS handshake per call under load.
+_http_client = httpx.AsyncClient(follow_redirects=False)
 
 
 @mcp.tool()
@@ -49,10 +52,9 @@ async def fetch_url(url: str, max_char: int = 4000, timeout: float = 15.0) -> st
         timeout: The timeout in seconds.
     """
     validate_url_and_host(url)
-    async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        return response.text[:max_char]
+    response = await _http_client.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.text[:max_char]
 
 
 @mcp.tool()
@@ -74,10 +76,9 @@ async def fact_check(claim: str) -> str:
     if top_url:
         try:
             validate_url_and_host(top_url)
-            async with httpx.AsyncClient(follow_redirects=False, timeout=10.0) as client:
-                resp = await client.get(top_url)
-                resp.raise_for_status()
-                extra = f"\n\nFull content from top source ({top_url}):\n{resp.text[:2000]}"
+            resp = await _http_client.get(top_url, timeout=10.0)
+            resp.raise_for_status()
+            extra = f"\n\nFull content from top source ({top_url}):\n{resp.text[:2000]}"
         except Exception:
             pass
     return snippets + extra

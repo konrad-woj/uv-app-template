@@ -134,6 +134,8 @@ def _make_null_gliguard() -> MagicMock:
     g = MagicMock(spec=GLiGuardClient)
     g.check_input.return_value = GuardResult(blocked=False)
     g.check_output.return_value = GuardResult(blocked=False)
+    g.acheck_input = AsyncMock(return_value=GuardResult(blocked=False))
+    g.acheck_output = AsyncMock(return_value=GuardResult(blocked=False))
     return g
 
 

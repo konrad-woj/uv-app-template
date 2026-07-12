@@ -1,9 +1,16 @@
-# Scoring rubric for the pre-sales proposal agent
+# Scoring rubric — see evals/datasets/sample.yaml for a note on this file's
+# "pre-sales proposal" framing vs. the actually-implemented research-assistant agent.
 #
 # TWO evaluation layers:
 #
-#   quality_criteria   — LLM-judge scores; used by the Reflection critic subgraph
-#                        AND by the offline eval runner in run_experiment.py.
+#   quality_criteria   — LLM-judge scores, consumed by evals/evaluators.py's
+#                        quality_score_evaluator (PROVISIONAL freeform-JSON judge,
+#                        pre-Phase-5b — see evals/evaluators.py:run_quality_judge).
+#                        NOT currently read by the Reflection critic subgraph
+#                        (app/graph/nodes/subgraphs/reflection.py) — that node has
+#                        its own simple pass/fail + one-sentence critique prompt,
+#                        unrelated to this file (checked directly against the
+#                        implementation, not assumed).
 #                        Each criterion returns a 0–max_score integer + a one-line
 #                        reason string.  Proposal passes when total >= pass_threshold
 #                        AND every per-criterion minimum is met.
@@ -14,8 +21,8 @@
 #                        quality problem.  Organised per-node so each node can be
 #                        tested in isolation with a fake upstream state.
 #
-# Both layers are consumed by run_experiment.py and by the unit tests in
-# tests/evals/test_evaluators.py.
+# Both layers are consumed by evals/run_experiment.py and by the unit tests in
+# tests/evals/test_evaluators.py and tests/evals/test_trace_assertions.py.
 
 # ---------------------------------------------------------------------------
 # Layer 1 — LLM quality criteria
@@ -95,8 +102,9 @@ pass_policy:
   minimum_total: 10          # out of 13 maximum
   # Per-criterion minimums are declared inline above (per_criterion_minimum field).
 
-  # Used by the Reflection subgraph to decide whether to loop.
-  # The critic LLM must output a JSON object matching this schema:
+  # Used by evals/evaluators.py:run_quality_judge (see note above — not the
+  # Reflection subgraph, which uses its own unrelated pass/fail prompt).
+  # The judge LLM must output a JSON object matching this schema:
   #   { "scores": { "<criterion_id>": { "score": int, "reason": str }, … },
   #     "total": int,
   #     "passed": bool,
@@ -109,6 +117,15 @@ pass_policy:
 # Each assertion is evaluated against the LangGraph checkpoint history and/or
 # final AgentState without calling an LLM.
 #
+# CORRECTED as part of Phase 5d (see PLAN.md): this section originally
+# referenced a "search_subgraph" / "searcher" fan-out and a "search_results"
+# state field that never shipped — the actual graph (app/graph/workflow.py)
+# replaced that early design with a single-node ReAct loop (react_researcher)
+# and has no such field in AgentState (app/graph/state.py). Node names and
+# state fields below now match the real graph. `resume_guard` was also added
+# to the flow between `planner` and `react_researcher` and is included in
+# ta_flow_all_nodes_executed accordingly.
+#
 # Fields:
 #   id           — unique assertion ID (used in test reports)
 #   node         — which node this assertion targets ("flow" = end-to-end)
@@ -116,11 +133,15 @@ pass_policy:
 #   check        — what to inspect:
 #                    state_field   — read a key from the final AgentState
 #                    checkpoint    — inspect the checkpoint history list
-#                    messages      — inspect the messages list in state
-#   condition    — the assertion predicate (see run_experiment.py for evaluation)
+#                    messages      — inspect the messages list in the final AgentState
+#   condition    — the assertion predicate (see evals/trace_assertions.py for evaluation)
 #   expected     — expected value (for equality / membership checks)
 #   negative_case — if true, this assertion only applies to negative-path runs
-#                   (approve_plan: false in the dataset entry)
+#                   (e.g. approve_plan: false, or an off-topic/harmful-output probe).
+#                   evals/datasets/sample.yaml has no negative-case items today —
+#                   adversarial probes are the Phase 5c guardrail_redteam suite's job.
+#                   evals/trace_assertions.py evaluates negative_case assertions only
+#                   when explicitly asked to (include_negative_cases=True).
 
 trace_assertions:
 
@@ -129,7 +150,7 @@ trace_assertions:
   - id: ta_input_guard_blocks_off_topic
     node: input_guard
     description: >
-      When the user message is off-topic (not a pre-sales tech question),
+      When the user message is off-topic (not a research question),
       input_guard must set status="blocked" and guard_reason must be non-empty.
     check: state_field
     fields: [status, guard_reason]
@@ -142,7 +163,7 @@ trace_assertions:
   - id: ta_input_guard_passes_valid
     node: input_guard
     description: >
-      When the user message is a valid pre-sales query, input_guard must NOT
+      When the user message is a valid research query, input_guard must NOT
       set status="blocked"; the graph must continue to planner.
     check: checkpoint
     condition: node_executed
@@ -154,7 +175,8 @@ trace_assertions:
     node: planner
     description: >
       On the first invocation, the planner must pause the graph (interrupt).
-      The checkpoint snapshot.next must contain "planner" after the first turn.
+      Some checkpoint's next must be exactly ("planner",) — the graph suspended
+      awaiting human approval.
     check: checkpoint
     condition: graph_interrupted_at
     expected: planner
@@ -171,7 +193,7 @@ trace_assertions:
     node: planner
     description: >
       When the human resumes with approve=false, status must be set to "aborted"
-      and the graph must not proceed to search_subgraph.
+      and the graph must not proceed to resume_guard / react_researcher.
     check: state_field
     fields: [status]
     condition: equals
@@ -179,28 +201,16 @@ trace_assertions:
       status: aborted
     negative_case: true
 
-  # --- search_subgraph (fan-out / fan-in) ---
+  # --- resume_guard ---
 
-  - id: ta_search_branches_match_plan
-    node: search_subgraph
+  - id: ta_resume_guard_passes_valid
+    node: resume_guard
     description: >
-      The number of searcher branches executed must equal len(plan).
-      Verified by counting "searcher" node appearances in checkpoint history.
+      On the happy path (approve=true, clean resume message), the graph must
+      continue past resume_guard to react_researcher.
     check: checkpoint
-    condition: node_execution_count_equals
-    expected:
-      node: searcher
-      count_source: state_field
-      count_field: plan
-      count_transform: len
-
-  - id: ta_search_results_populated
-    node: search_subgraph
-    description: >
-      After search_subgraph completes, search_results must be a non-empty list.
-    check: state_field
-    fields: [search_results]
-    condition: non_empty_list
+    condition: node_executed
+    expected: react_researcher
 
   # --- react_researcher (ReAct) ---
 
@@ -318,16 +328,17 @@ trace_assertions:
     node: flow
     description: >
       Checkpoint history must contain at least one entry for each main node:
-      input_guard, planner, search_subgraph, react_researcher, writer,
-      reflection_subgraph, output_guard.
+      input_guard, planner, resume_guard, react_researcher, writer,
+      verify_subgraph, reflection_subgraph, output_guard.
     check: checkpoint
     condition: all_nodes_executed
     expected:
       - input_guard
       - planner
-      - search_subgraph
+      - resume_guard
       - react_researcher
       - writer
+      - verify_subgraph
       - reflection_subgraph
       - output_guard
 

@@ -39,6 +39,10 @@ class Settings(BaseSettings):
         default="postgresql://postgres:postgres@localhost:5433/langgraph",
         description="PostgreSQL connection string for LangGraph checkpointer.",
     )
+    db_pool_max_size: int = Field(
+        default=20,
+        description="Maximum connections in the checkpointer's AsyncConnectionPool.",
+    )
     llm_model: str = Field(
         default="openai/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit",
         description="LiteLLM model identifier (e.g. 'openai/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit', 'gpt-5-mini').",
@@ -71,6 +75,10 @@ class Settings(BaseSettings):
         default=10.0,
         description="Per-attempt timeout in seconds for connecting to the MCP server and listing tools.",
     )
+    mcp_tool_call_timeout_seconds: float = Field(
+        default=30.0,
+        description="Per-call timeout in seconds for invoking an MCP tool (e.g. fact_check) from within a node.",
+    )
     max_reflection_attempts: int = Field(
         default=5,
         description="Hard ceiling on reflection critic/refiner iterations. Loop exits on quality pass or when this limit is reached.",
@@ -98,6 +106,21 @@ class Settings(BaseSettings):
     guard_device: str = Field(
         default="cpu",
         description="Device for GLiGuard inference: 'cpu', 'cuda', or 'mps'.",
+    )
+    guard_timeout_seconds: float = Field(
+        default=10.0,
+        description="Per-call timeout in seconds for GLiGuard classification calls. Exceeding it raises GuardTimeoutError.",
+    )
+    guard_max_concurrency: int = Field(
+        default=4,
+        description=(
+            "Maximum concurrent GLiGuard inference calls across all requests. "
+            "Bounds RAM/VRAM use under concurrent traffic; excess calls queue on a semaphore."
+        ),
+    )
+    readiness_check_timeout_seconds: float = Field(
+        default=3.0,
+        description="Timeout in seconds for the /ready endpoint's database connectivity check.",
     )
     api_key: str | None = Field(
         default=None,

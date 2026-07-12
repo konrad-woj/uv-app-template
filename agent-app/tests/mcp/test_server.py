@@ -54,16 +54,12 @@ class TestWebSearch:
         assert "No results found" in result
 
 
-def _make_httpx_mock(text: str) -> AsyncMock:
-    """Return a mock httpx.AsyncClient whose get() returns a response with the given text."""
+def _mock_http_get(text: str) -> AsyncMock:
+    """Return a mock for the shared _http_client.get() returning a response with the given text."""
     mock_response = AsyncMock()
     mock_response.text = text
     mock_response.raise_for_status = MagicMock(return_value=None)
-    mock_ctx = AsyncMock()
-    mock_ctx.__aenter__ = AsyncMock(return_value=mock_ctx)
-    mock_ctx.__aexit__ = AsyncMock(return_value=False)
-    mock_ctx.get = AsyncMock(return_value=mock_response)
-    return mock_ctx
+    return AsyncMock(return_value=mock_response)
 
 
 class TestValidateUrl:
@@ -104,13 +100,13 @@ class TestValidateUrl:
 
 class TestFetchUrl:
     async def test_returns_string_content(self) -> None:
-        with patch("app.mcp.server.httpx.AsyncClient", return_value=_make_httpx_mock("<html>Hello world</html>")):
+        with patch("app.mcp.server._http_client.get", _mock_http_get("<html>Hello world</html>")):
             result = await fetch_url("https://example.com")
         assert isinstance(result, str)
         assert "Hello world" in result
 
     async def test_truncates_to_4000_chars(self) -> None:
-        with patch("app.mcp.server.httpx.AsyncClient", return_value=_make_httpx_mock("x" * 10_000)):
+        with patch("app.mcp.server._http_client.get", _mock_http_get("x" * 10_000)):
             result = await fetch_url("https://example.com")
         assert len(result) <= 4000
 

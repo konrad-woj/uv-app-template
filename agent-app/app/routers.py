@@ -53,7 +53,7 @@ from collections.abc import AsyncGenerator
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
@@ -75,7 +75,47 @@ health_router = APIRouter()
 
 @health_router.get("/health", tags=["meta"])
 async def health() -> dict:
+    """Liveness probe — process is up and serving requests. No dependency checks."""
     return {"status": "ok"}
+
+
+@health_router.get("/ready", tags=["meta"])
+async def ready(request: Request) -> JSONResponse:
+    """Readiness probe — verifies the graph can actually serve a request.
+
+    Checks GLiGuard model load state, Postgres checkpointer connectivity, and
+    MCP tool availability. Returns 503 with per-check detail when a dependency
+    is down, so k8s stops routing traffic to this pod without restarting it
+    (restarting wouldn't help if e.g. the MCP server or Postgres is the one down).
+    """
+    state = request.app.state
+    checks: dict[str, bool] = {}
+
+    gliguard = getattr(state, "gliguard", None)
+    checks["gliguard_loaded"] = bool(gliguard is not None and gliguard.loaded)
+
+    checkpointer = getattr(state, "checkpointer", None)
+    if checkpointer is None:
+        checks["database"] = False
+    else:
+        try:
+
+            async def _ping() -> None:
+                async with checkpointer.conn.connection() as conn:
+                    await conn.execute("SELECT 1")
+
+            await asyncio.wait_for(_ping(), timeout=settings.readiness_check_timeout_seconds)
+            checks["database"] = True
+        except Exception:
+            checks["database"] = False
+
+    checks["mcp_tools_loaded"] = getattr(state, "mcp_tool_count", 0) > 0
+
+    ok = all(checks.values())
+    return JSONResponse(
+        status_code=200 if ok else 503,
+        content={"status": "ok" if ok else "unavailable", "checks": checks},
+    )
 
 
 # ---------------------------------------------------------------------------

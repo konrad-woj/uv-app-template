@@ -4,7 +4,8 @@ Uses a standalone FastAPI app (no lifespan) with the graph dependency overridden
 by a mock, so no Postgres or MCP server is required.
 """
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -95,6 +96,65 @@ class TestHealth:
 
 
 # ---------------------------------------------------------------------------
+# GET /ready
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def app_state() -> Generator[Any]:
+    """Set up a fully-healthy app.state, torn down after the test."""
+    gliguard = MagicMock()
+    gliguard.loaded = True
+    checkpointer = MagicMock()
+    pool_conn = AsyncMock()
+    checkpointer.conn.connection.return_value.__aenter__ = AsyncMock(return_value=pool_conn)
+    checkpointer.conn.connection.return_value.__aexit__ = AsyncMock(return_value=False)
+    _app.state.gliguard = gliguard
+    _app.state.checkpointer = checkpointer
+    _app.state.mcp_tool_count = 3
+    yield _app.state
+    for attr in ("gliguard", "checkpointer", "mcp_tool_count"):
+        if hasattr(_app.state, attr):
+            delattr(_app.state, attr)
+
+
+class TestReady:
+    async def test_all_dependencies_healthy_returns_200(self, client: AsyncClient, app_state: MagicMock) -> None:
+        response = await client.get("/ready")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["checks"] == {"gliguard_loaded": True, "database": True, "mcp_tools_loaded": True}
+
+    async def test_gliguard_not_loaded_returns_503(self, client: AsyncClient, app_state: MagicMock) -> None:
+        app_state.gliguard.loaded = False
+        response = await client.get("/ready")
+        assert response.status_code == 503
+        assert response.json()["checks"]["gliguard_loaded"] is False
+
+    async def test_database_unreachable_returns_503(self, client: AsyncClient, app_state: MagicMock) -> None:
+        app_state.checkpointer.conn.connection.return_value.__aenter__ = AsyncMock(
+            side_effect=RuntimeError("connection refused")
+        )
+        response = await client.get("/ready")
+        assert response.status_code == 503
+        assert response.json()["checks"]["database"] is False
+
+    async def test_no_mcp_tools_returns_503(self, client: AsyncClient, app_state: MagicMock) -> None:
+        app_state.mcp_tool_count = 0
+        response = await client.get("/ready")
+        assert response.status_code == 503
+        assert response.json()["checks"]["mcp_tools_loaded"] is False
+
+    async def test_missing_dependencies_returns_503(self, client: AsyncClient) -> None:
+        """Before lifespan populates app.state (or if a dependency was never set)."""
+        response = await client.get("/ready")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["checks"] == {"gliguard_loaded": False, "database": False, "mcp_tools_loaded": False}
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/chat — fresh turn (not interrupted)
 # ---------------------------------------------------------------------------
 
@@ -134,7 +194,7 @@ class TestChatFreshTurn:
     async def test_new_interrupt_after_invocation_sets_is_interrupted(
         self, client: AsyncClient, mock_graph: MagicMock
     ) -> None:
-        """Graph suspends mid-run (planner fires interrupt); response reflects the new interrupt."""
+        """Graph suspends mid-run (plan_review fires interrupt); response reflects the new interrupt."""
         mock_graph.aget_state = AsyncMock(side_effect=[_snapshot(), _interrupted_snapshot({"plan": ["Step A"]})])
         mock_graph.ainvoke = AsyncMock(return_value={"status": "planning"})
 

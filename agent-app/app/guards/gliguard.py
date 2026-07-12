@@ -16,10 +16,13 @@ Test usage (no model needed):
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from logger import get_logger
+
+from app.exceptions import GuardTimeoutError
 
 if TYPE_CHECKING:
     pass
@@ -120,12 +123,23 @@ class GLiGuardClient:
     Args:
         model_name: HuggingFace model identifier.
         device: Inference device: 'cpu', 'cuda', or 'mps'.
+        max_concurrency: Maximum concurrent inference calls through acheck_input/
+            acheck_output. All requests share this one loaded model instance, so
+            unbounded concurrency means unbounded concurrent forward passes —
+            each with its own activation memory — which can exhaust host RAM or,
+            worse, GPU VRAM under load. Excess calls queue on a semaphore instead.
     """
 
-    def __init__(self, model_name: str, device: str = "cpu") -> None:
+    def __init__(self, model_name: str, device: str = "cpu", max_concurrency: int = 4) -> None:
         self._model_name = model_name
         self._device = device
         self._model = None  # populated by load()
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+
+    @property
+    def loaded(self) -> bool:
+        """Whether load() has completed and the model is ready for inference."""
+        return self._model is not None
 
     def load(self) -> None:
         """Download (if needed) and load the GLiNER2 model into memory."""
@@ -183,3 +197,27 @@ class GLiGuardClient:
             logger.warning("PII detected in output — redacting", entity_types=entity_types, span_count=len(spans))
 
         return GuardResult(blocked=False, flagged_spans=spans)
+
+    async def acheck_input(self, text: str, timeout: float) -> GuardResult:
+        """Async, timeout-bounded wrapper around check_input.
+
+        Runs the classification call in a worker thread so it never blocks the
+        event loop, and bounds it with `timeout` so a hung/slow model can't stall
+        a request indefinitely.
+
+        Raises:
+            GuardTimeoutError: if the call exceeds `timeout` seconds.
+        """
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(self.check_input, text), timeout=timeout)
+            except TimeoutError as exc:
+                raise GuardTimeoutError(f"GLiGuard check_input timed out after {timeout}s") from exc
+
+    async def acheck_output(self, text: str, timeout: float) -> GuardResult:
+        """Async, timeout-bounded wrapper around check_output. See acheck_input."""
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(self.check_output, text), timeout=timeout)
+            except TimeoutError as exc:
+                raise GuardTimeoutError(f"GLiGuard check_output timed out after {timeout}s") from exc
