@@ -34,14 +34,11 @@ from pydantic import BaseModel, field_validator
 
 from app.config import settings
 from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
+from app.prompts.loader import load_system, render_human
 
 logger = get_logger(__name__)
 
-_VERIFY_PROMPT = """You are a fact-checker. Given a factual claim and evidence from web search, \
-determine whether the evidence supports the claim.
-
-Respond with JSON only:
-{"supported": true or false, "confidence": "high" | "medium" | "low", "reason": "<one sentence>"}"""
+_VERIFY_PROMPT = load_system("verification", "verify")
 
 
 class VerificationState(TypedDict):
@@ -83,7 +80,7 @@ def make_verifier_node(llm: BaseChatModel, fact_check_tool: BaseTool | None) -> 
         # Step 2: LLM verification — structured verdict from evidence.
         messages = [
             SystemMessage(content=_VERIFY_PROMPT),
-            HumanMessage(content=f"Claim: {claim}\n\nEvidence:\n{evidence}"),
+            HumanMessage(content=render_human("verification", "verify", claim=claim, evidence=evidence)),
         ]
         response = await llm_invoke_with_retry(llm, messages, config)
         parsed = parse_structured(str(response.content), _VerifyResult)

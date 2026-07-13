@@ -22,13 +22,11 @@ from logger import get_logger
 from app.config import settings
 from app.graph.nodes._dead_letter import with_dead_letter
 from app.guards.gliguard import GLiGuardClient, redact
+from app.prompts.loader import load_text
 
 logger = get_logger(__name__)
 
-_SAFE_FALLBACK = (
-    "I was unable to produce a verified answer to your question. "
-    "Please try rephrasing or narrowing the scope of your query."
-)
+_SAFE_FALLBACK = load_text("output_guard", "safe_fallback")
 
 
 def make_output_guard_node(gliguard: GLiGuardClient) -> Callable:

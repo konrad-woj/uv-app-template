@@ -36,23 +36,12 @@ from app.graph.nodes._guard_verdict import GuardVerdict
 from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
 from app.graph.nodes._messages import get_last_human_text
 from app.guards.gliguard import GLiGuardClient
+from app.prompts.loader import load_system, render_human
 
 logger = get_logger(__name__)
 
-_PLAN_SYSTEM_PROMPT = """You are a research planning assistant.
-Given the user's research question, produce a numbered list of 3-5 concrete research steps.
-Each step should be a specific query or action to gather relevant information.
-Format: return only the numbered list, one step per line."""
-
-_PLAN_GUARD_PROMPT = """You are a quality and safety checker for research plans.
-Evaluate whether the research plan is appropriate and focused on legitimate information gathering.
-
-Disallowed: plans that involve accessing private systems, illegal activities, targeted harassment,
-or gathering information to cause harm.
-
-Respond with a JSON object:
-{"verdict": "safe" or "unsafe", "reason": "<one sentence>"}
-Do not include any other text."""
+_PLAN_SYSTEM_PROMPT = load_system("planner", "plan")
+_PLAN_GUARD_PROMPT = load_system("planner", "plan_guard")
 
 
 def make_planner_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Callable:
@@ -88,7 +77,7 @@ def make_planner_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Callable:
         # LLM quality + safety check on plan text.
         guard_messages = [
             SystemMessage(content=_PLAN_GUARD_PROMPT),
-            HumanMessage(content=f"Research plan:\n{plan_as_text}"),
+            HumanMessage(content=render_human("planner", "plan_guard", plan=plan_as_text)),
         ]
         guard_response = await llm_invoke_with_retry(llm, guard_messages, config)
         verdict = parse_structured(str(guard_response.content), GuardVerdict)

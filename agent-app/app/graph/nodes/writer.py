@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from app.graph.nodes._dead_letter import with_dead_letter
 from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
 from app.graph.nodes._messages import get_last_human_text
+from app.prompts.loader import load_system, render_human
 
 logger = get_logger(__name__)
 
@@ -28,20 +29,7 @@ logger = get_logger(__name__)
 # what the writer LLM actually returns (the "3-5" in the prompt is not enforced by it).
 _MAX_CLAIMS = 5
 
-_SYSTEM_PROMPT = """You are a research writer. Given the user's research question,
-the research plan, and the gathered research context, write a comprehensive, well-structured answer.
-
-Be specific and ensure the answer directly addresses the question.
-Write in clear prose — no bullet points unless listing genuinely enumerable items.
-
-Return a JSON object with exactly two keys:
-{
-  "answer": "<full research answer in prose>",
-  "claims": ["<specific verifiable factual claim>", ...]
-}
-
-List 3–5 specific factual claims made in the answer that can be independently verified
-(e.g. dates, statistics, names, events). Do not include opinions or methodology as claims."""
+_SYSTEM_PROMPT = load_system("writer", "draft")
 
 
 class _WriterOutput(BaseModel):
@@ -63,7 +51,7 @@ def make_writer_node(llm: BaseChatModel) -> Callable:
             message_count=len(state["messages"]),
         )
         plan_summary = "\n".join(plan)
-        context = f"Question: {question}\n\nResearch plan:\n{plan_summary}"
+        context = render_human("writer", "draft", question=question, plan_summary=plan_summary)
         messages = [
             SystemMessage(content=_SYSTEM_PROMPT),
             HumanMessage(content=context),

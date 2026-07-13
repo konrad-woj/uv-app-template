@@ -28,20 +28,12 @@ from pydantic import BaseModel, field_validator
 
 from app.config import settings
 from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
+from app.prompts.loader import load_system, render_human
 
 logger = get_logger(__name__)
 
-_CRITIC_PROMPT = """You are a quality reviewer for research answers.
-Score the draft answer on: relevance, completeness, accuracy, and clarity.
-Determine if it is good enough to return to the user.
-
-Respond with JSON only:
-{"verdict": "pass" or "fail", "critique": "<one sentence explaining the main issue or confirming quality>"}"""
-
-_REFINER_PROMPT = """You are a research answer improver.
-Given the draft answer and critique, produce an improved version.
-Address the specific issues mentioned in the critique.
-Return only the improved answer text, no preamble."""
+_CRITIC_PROMPT = load_system("reflection", "critic")
+_REFINER_PROMPT = load_system("reflection", "refiner")
 
 
 class ReflectionState(TypedDict):
@@ -70,7 +62,7 @@ def make_critic_node(llm: BaseChatModel) -> Callable:
         t0 = time.perf_counter()
         messages = [
             SystemMessage(content=_CRITIC_PROMPT),
-            HumanMessage(content=f"Draft answer:\n{state['draft']}"),
+            HumanMessage(content=render_human("reflection", "critic", draft=state["draft"])),
         ]
         response = await llm_invoke_with_retry(llm, messages, config)
         parsed = parse_structured(str(response.content), _CriticResponse)
@@ -104,7 +96,9 @@ def make_refiner_node(llm: BaseChatModel) -> Callable:
         t0 = time.perf_counter()
         messages = [
             SystemMessage(content=_REFINER_PROMPT),
-            HumanMessage(content=f"Draft:\n{state['draft']}\n\nCritique:\n{state['critique']}"),
+            HumanMessage(
+                content=render_human("reflection", "refiner", draft=state["draft"], critique=state["critique"])
+            ),
         ]
         response = await llm_invoke_with_retry(llm, messages, config)
         refined = str(response.content)

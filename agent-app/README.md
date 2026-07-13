@@ -18,6 +18,7 @@ Each node in the graph is a vehicle for exactly one LangGraph or agentic pattern
 | **Dead letter** | `dead_letter` terminal node | Any unhandled node exception writes `DeadLetterInfo` to state and routes here instead of crashing |
 | **Time-travel** | `GET /v1/threads/{id}/history`, `POST /v1/threads/{id}/replay` | Postgres checkpointer stores every state snapshot; replay re-invokes from any checkpoint |
 | **Token streaming** | `POST /v1/chat/stream` | `astream_events` pipes writer-node tokens as SSE frames |
+| **Prompt externalization (i18n-ready)** | `app/prompts/en/**/*.md`, loaded via `app/prompts/loader.py` | Every node prompt lives in an external `.md` file keyed by `(locale, node, name)` instead of a Python string constant; `AGENT_LOCALE` selects the locale directory, so adding a language is a new sibling directory, not a code change |
 
 ## Reliability safeguards
 
@@ -122,6 +123,7 @@ All agent variables use the `AGENT_` prefix. Defaults work for local development
 
 | Variable | Default | Description |
 |---|---|---|
+| `AGENT_LOCALE` | `en` | Locale directory under `app/prompts/` used to load node prompts |
 | `AGENT_DB_URI` | `postgresql://postgres:postgres@localhost:5433/langgraph` | Postgres connection string |
 | `AGENT_DB_POOL_MAX_SIZE` | `20` | Max connections in the checkpointer's AsyncConnectionPool |
 | `AGENT_LLM_MODEL` | `openai/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit` | LiteLLM model identifier |
@@ -237,6 +239,9 @@ uv run pytest tests/guards/
 
 # MCP server tools
 uv run pytest tests/mcp/
+
+# Externalized prompt files (Phase 6) — no server/Postgres/MCP needed
+uv run pytest tests/test_prompts.py
 
 # Node-level evals (Phase 5a) — one node factory at a time, no server/Postgres/MCP needed
 uv run pytest tests/evals/test_node_tasks.py

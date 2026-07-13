@@ -3,6 +3,7 @@
 Pydantic-settings reads env vars with the AGENT_ prefix automatically.
 
 Example .env:
+    AGENT_LOCALE=en
     AGENT_DB_URI=postgresql://postgres:postgres@localhost:5433/langgraph
     AGENT_LLM_MODEL=openai/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit
     AGENT_LLM_BASE_URL=http://127.0.0.1:8888/v1
@@ -35,6 +36,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    locale: str = Field(
+        default="en",
+        description="Locale directory under app/prompts/ used to load node prompts (e.g. 'en').",
+    )
     db_uri: str = Field(
         default="postgresql://postgres:postgres@localhost:5433/langgraph",
         description="PostgreSQL connection string for LangGraph checkpointer.",

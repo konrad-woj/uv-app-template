@@ -24,7 +24,7 @@
     - [Phase 5b — Structured rubric-judge schema](#phase-5b--structured-rubric-judge-schema-reasoning--score--confidence)
     - [Phase 5c — Categorized adversarial guardrail suite](#phase-5c--categorized-adversarial-guardrail-suite)
     - [Phase 5e — Unified eval entrypoint](#phase-5e--unified-eval-entrypoint-evalsrunpy)
-  - [Phase 6 — Prompt Externalization (i18n-ready)](#phase-6--prompt-externalization-i18n-ready--not-yet-implemented)
+  - [Phase 6 — Prompt Externalization (i18n-ready)](#phase-6--prompt-externalization-i18n-ready---implemented)
 - [Dependencies](#dependencies)
 - [README.md Guide Sections](#readmemd-guide-sections)
 - [LangGraph Studio Config](#langgraph-studio-config-langgraphjson)
@@ -1010,7 +1010,7 @@ listing what's available.
 
 ---
 
-### Phase 6 — Prompt Externalization (i18n-ready) — not yet implemented
+### Phase 6 — Prompt Externalization (i18n-ready) — ✓ implemented
 
 **Why**: every LLM-calling node hardcodes its prompt as a private module-level Python string
 constant (`_TOPIC_CHECK_PROMPT`, `_PLAN_SYSTEM_PROMPT`, `_PLAN_GUARD_PROMPT`, `_SYSTEM_PROMPT`,
@@ -1037,7 +1037,8 @@ integration code (those are *enabled* by this structure, not built now).
 
 **Critical implementation rule**: several system prompts contain literal JSON braces in their
 "respond with JSON" instructions (e.g. `{"verdict": "safe" or "unsafe", ...}` in
-`_TOPIC_CHECK_PROMPT`, `_PLAN_GUARD_PROMPT`, `_CRITIC_PROMPT`, `_VERIFY_PROMPT`). None of the
+`_TOPIC_CHECK_PROMPT`, `_PLAN_GUARD_PROMPT`, `_CRITIC_PROMPT`, `_VERIFY_PROMPT`, and writer's
+`_SYSTEM_PROMPT` which embeds a literal `{"answer": ..., "claims": [...]}` block). None of the
 system prompts have real `{slot}` placeholders — they are 100% static text. **System prompt
 files are always read raw (`.read_text()`), never passed through `.format()`.** Only
 `.human.md` files (which have genuine `{slot}` placeholders and no literal braces) get
