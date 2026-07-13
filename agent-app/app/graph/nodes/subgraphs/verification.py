@@ -30,10 +30,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Send
 from logger import get_logger
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, field_validator
 
 from app.config import settings
-from app.graph.nodes._llm_invoke import llm_invoke_with_retry
+from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
 
 logger = get_logger(__name__)
 
@@ -86,15 +86,15 @@ def make_verifier_node(llm: BaseChatModel, fact_check_tool: BaseTool | None) -> 
             HumanMessage(content=f"Claim: {claim}\n\nEvidence:\n{evidence}"),
         ]
         response = await llm_invoke_with_retry(llm, messages, config)
-        try:
-            parsed = _VerifyResult.model_validate_json(str(response.content))
+        parsed = parse_structured(str(response.content), _VerifyResult)
+        if parsed is not None:
             result = {
                 "claim": claim,
                 "supported": parsed.supported,
                 "confidence": parsed.confidence,
                 "reason": parsed.reason,
             }
-        except (ValidationError, ValueError):
+        else:
             # Fail-open: parse error → treat as supported to avoid false blocks.
             logger.warning("verifier.parse_failed", claim_length=len(claim))
             result = {

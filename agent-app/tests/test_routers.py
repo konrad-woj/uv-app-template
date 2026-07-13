@@ -738,7 +738,11 @@ class TestChatStream:
         thinking_chunk = AIMessageChunk(content=[{"type": "thinking", "thinking": "internal reasoning"}])
         text_chunk = AIMessageChunk(content=[{"type": "text", "text": "Final answer"}])
         events = [
-            {"event": "on_chat_model_stream", "metadata": {"langgraph_node": "writer"}, "data": {"chunk": thinking_chunk}},
+            {
+                "event": "on_chat_model_stream",
+                "metadata": {"langgraph_node": "writer"},
+                "data": {"chunk": thinking_chunk},
+            },
             {"event": "on_chat_model_stream", "metadata": {"langgraph_node": "writer"}, "data": {"chunk": text_chunk}},
         ]
         mock_graph.astream_events = MagicMock(return_value=_astream(*events))

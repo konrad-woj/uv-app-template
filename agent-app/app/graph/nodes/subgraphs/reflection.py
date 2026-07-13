@@ -24,10 +24,10 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from logger import get_logger
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, field_validator
 
 from app.config import settings
-from app.graph.nodes._llm_invoke import llm_invoke_with_retry
+from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
 
 logger = get_logger(__name__)
 
@@ -73,11 +73,11 @@ def make_critic_node(llm: BaseChatModel) -> Callable:
             HumanMessage(content=f"Draft answer:\n{state['draft']}"),
         ]
         response = await llm_invoke_with_retry(llm, messages, config)
-        try:
-            parsed = _CriticResponse.model_validate_json(str(response.content))
+        parsed = parse_structured(str(response.content), _CriticResponse)
+        if parsed is not None:
             passed = parsed.verdict == "pass"
             critique = parsed.critique
-        except (ValidationError, ValueError):
+        else:
             passed = True  # parse failure → treat as pass to avoid infinite loop
             critique = "Could not parse critic response."
         duration_ms = round((time.perf_counter() - t0) * 1000)
@@ -135,8 +135,3 @@ def build_reflection_subgraph(llm: BaseChatModel) -> CompiledStateGraph:
     graph.add_conditional_edges("critic", should_refine)
     graph.add_edge("refiner", "critic")
     return graph.compile()
-
-
-# Module-level stub for import compatibility; replaced at runtime by compile_graph()
-# which injects the real LLM.  Tests should call build_reflection_subgraph(mock_llm).
-reflection_subgraph: CompiledStateGraph | None = None

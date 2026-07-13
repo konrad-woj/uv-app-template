@@ -136,6 +136,9 @@ async def dead_letter_metrics() -> dict:
 
 router = APIRouter()
 
+# Effectively-unlimited ceiling used when AGENT_RATE_LIMIT is unset (rate limiting disabled).
+_DEFAULT_RATE_LIMIT = "10000/minute"
+
 
 def _extract_interrupt_value(snapshot) -> dict | None:
     """Extract the interrupt payload from the first suspended task in a snapshot."""
@@ -148,8 +151,21 @@ def _extract_interrupt_value(snapshot) -> dict | None:
     return raw.value if hasattr(raw, "value") else None
 
 
+def _build_config(thread_id: str, checkpoint_id: str | None = None) -> RunnableConfig:
+    """Build a RunnableConfig for a graph invocation, bounded by AGENT_MAX_PIPELINE_STEPS."""
+    configurable: dict[str, str] = {"thread_id": thread_id}
+    if checkpoint_id is not None:
+        configurable["checkpoint_id"] = checkpoint_id
+    return {"configurable": configurable, "recursion_limit": settings.max_pipeline_steps}
+
+
+def _is_interrupted(snapshot) -> bool:
+    """Whether a state snapshot is currently suspended at an interrupt()."""
+    return bool(snapshot.next) and bool(snapshot.values)
+
+
 @router.post("/v1/chat", response_model=ChatResponse, tags=["chat"])
-@limiter.limit(settings.rate_limit or "10000/minute")
+@limiter.limit(settings.rate_limit or _DEFAULT_RATE_LIMIT)
 async def chat(
     request: Request,
     body: ChatRequest,
@@ -167,10 +183,7 @@ async def chat(
     If not interrupted, the new HumanMessage is injected and the graph runs
     forward.
     """
-    config: RunnableConfig = {
-        "configurable": {"thread_id": body.thread_id},
-        "recursion_limit": settings.max_pipeline_steps,
-    }
+    config = _build_config(body.thread_id)
 
     # Everything below can raise the same LLM/DB/recursion errors the streaming
     # endpoint already classifies via _classify_error — without this try/except
@@ -180,7 +193,7 @@ async def chat(
     try:
         # Check if the thread is currently suspended at an interrupt.
         snapshot = await graph.aget_state(config)
-        is_interrupted = bool(snapshot.next) and snapshot.values
+        is_interrupted = _is_interrupted(snapshot)
 
         if is_interrupted:
             if body.approve is None:
@@ -207,7 +220,7 @@ async def chat(
         code, detail = _classify_error(exc)
         raise HTTPException(status_code=code, detail=detail) from exc
 
-    now_interrupted = bool(post_snapshot.next) and bool(post_snapshot.values)
+    now_interrupted = _is_interrupted(post_snapshot)
 
     return ChatResponse(
         thread_id=body.thread_id,
@@ -289,7 +302,7 @@ async def _generate(
 
 
 @router.post("/v1/chat/stream", tags=["chat"])
-@limiter.limit(settings.rate_limit or "10000/minute")
+@limiter.limit(settings.rate_limit or _DEFAULT_RATE_LIMIT)
 async def chat_stream(
     request: Request,
     body: ChatRequest,
@@ -306,13 +319,10 @@ async def chat_stream(
     Resume an interrupt: call this endpoint again with the same thread_id
     and approve=true or approve=false in the request body.
     """
-    config: RunnableConfig = {
-        "configurable": {"thread_id": body.thread_id},
-        "recursion_limit": settings.max_pipeline_steps,
-    }
+    config = _build_config(body.thread_id)
 
     snapshot = await graph.aget_state(config)
-    is_interrupted = bool(snapshot.next) and snapshot.values
+    is_interrupted = _is_interrupted(snapshot)
 
     if is_interrupted and body.approve is None:
         interrupt_value = _extract_interrupt_value(snapshot)
@@ -373,7 +383,7 @@ async def get_history(
 
 
 @router.post("/v1/threads/{thread_id}/replay", response_model=ChatResponse, tags=["threads"])
-@limiter.limit(settings.rate_limit or "10000/minute")
+@limiter.limit(settings.rate_limit or _DEFAULT_RATE_LIMIT)
 async def replay(
     request: Request,
     thread_id: str,
@@ -391,13 +401,7 @@ async def replay(
     pointing at a historical checkpoint_id — the new input diverges from that
     point and the original branch is preserved.
     """
-    config: RunnableConfig = {
-        "configurable": {
-            "thread_id": thread_id,
-            "checkpoint_id": body.checkpoint_id,
-        },
-        "recursion_limit": settings.max_pipeline_steps,
-    }
+    config = _build_config(thread_id, checkpoint_id=body.checkpoint_id)
     # Look up the checkpoint first so a bad/missing checkpoint_id (Postgres raises
     # on a malformed UUID; an empty snapshot means no matching row) is always a 404,
     # distinct from a real failure during replay execution below — a Postgres

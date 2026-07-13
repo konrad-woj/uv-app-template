@@ -15,6 +15,7 @@ class TestValidateExpectedOutputs:
         items = [
             {
                 "id": "case_1",
+                "input": {"messages": [{"content": "hello"}]},
                 "expected_output": {
                     "must_address": [{"id": "pp1", "description": "x"}],
                     "must_reference": ["Django"],
@@ -30,6 +31,7 @@ class TestValidateExpectedOutputs:
         items = [
             {
                 "id": "case_1",
+                "input": {"messages": [{"content": "hello"}]},
                 "expected_output": {"must_referencee": ["Django"]},  # typo'd field
             }
         ]
@@ -37,8 +39,24 @@ class TestValidateExpectedOutputs:
             _validate_expected_outputs("fixture.yaml", items)
 
     def test_wrong_type_raises(self) -> None:
-        items = [{"id": "case_1", "expected_output": {"must_reference": "Django"}}]  # should be a list
+        items = [
+            {
+                "id": "case_1",
+                "input": {"messages": [{"content": "hello"}]},
+                "expected_output": {"must_reference": "Django"},  # should be a list
+            }
+        ]
         with pytest.raises(ValueError):
+            _validate_expected_outputs("fixture.yaml", items)
+
+    def test_missing_input_key_raises_with_file_and_item_context(self) -> None:
+        items = [{"id": "case_1", "expected_output": {}}]
+        with pytest.raises(ValueError, match=r"fixture\.yaml.*case_1.*'input'"):
+            _validate_expected_outputs("fixture.yaml", items)
+
+    def test_missing_expected_output_key_raises_with_file_and_item_context(self) -> None:
+        items = [{"id": "case_1", "input": {"messages": [{"content": "hello"}]}}]
+        with pytest.raises(ValueError, match=r"fixture\.yaml.*case_1.*'expected_output'"):
             _validate_expected_outputs("fixture.yaml", items)
 
 

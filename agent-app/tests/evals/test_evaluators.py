@@ -105,6 +105,17 @@ class TestRunQualityJudge:
         assert verdict.total == 3
         assert verdict.passed is True
 
+    async def test_returns_parsed_verdict_when_wrapped_in_markdown_code_fence(self) -> None:
+        payload = (
+            '```json\n{"scores": {"specificity": {"score": 3, "reason": "very specific"}}, '
+            '"total": 3, "passed": true, "summary": "great"}\n```'
+        )
+        with patch("evals.evaluators.build_llm", return_value=_mock_llm(payload)):
+            verdict = await run_quality_judge("q", "answer", _CRITERIA, judge_model=None)
+        assert verdict is not None
+        assert verdict.total == 3
+        assert verdict.passed is True
+
 
 class TestQualityScoreEvaluator:
     async def test_zero_when_no_final_answer(self) -> None:

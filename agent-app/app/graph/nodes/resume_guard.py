@@ -15,13 +15,12 @@ On error:  with_dead_letter catches the exception and routes to dead_letter.
 
 from collections.abc import Callable
 
-from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from logger import get_logger
 
-from app.config import settings
 from app.graph.nodes._dead_letter import with_dead_letter
-from app.graph.nodes._prompt_utils import sanitize_user_text
+from app.graph.nodes._guard_layers import run_sanitize_and_injection_check
+from app.graph.nodes._messages import get_last_human_text
 from app.guards.gliguard import GLiGuardClient
 
 logger = get_logger(__name__)
@@ -32,30 +31,15 @@ def make_resume_guard_node(gliguard: GLiGuardClient) -> Callable:
 
     @with_dead_letter("resume_guard")
     async def resume_guard(state: "AgentState", config: RunnableConfig) -> dict:  # type: ignore[name-defined]  # noqa: F821
-        last_human = next(
-            (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
-            None,
-        )
-        raw_text = str(last_human.content) if last_human else ""
+        raw_text = get_last_human_text(state["messages"])
         logger.info("resume_guard.inputs", input_text_length=len(raw_text))
 
-        # Layer 1: regex sanitisation.
-        try:
-            clean_text = sanitize_user_text(raw_text)
-        except ValueError as exc:
-            logger.info("resume_guard.layer1_blocked", reason=str(exc))
-            return {"status": "blocked", "guard_reason": f"Resume message rejected by sanitiser: {exc}"}
-        logger.info("resume_guard.layer1_passed")
-
-        # Layer 2: GLiGuard injection/jailbreak check.
-        guard_result = await gliguard.acheck_input(clean_text, settings.guard_timeout_seconds)
-        if guard_result.blocked:
-            logger.info("resume_guard.layer2_blocked", reason=guard_result.reason)
-            return {
-                "status": "blocked",
-                "guard_reason": guard_result.reason or "Resume message failed injection check.",
-            }
-        logger.info("resume_guard.layer2_passed")
+        # Layers 1-2: regex sanitisation, then GLiGuard injection/jailbreak check.
+        result = await run_sanitize_and_injection_check(
+            gliguard, raw_text, "resume_guard", "Resume message", "Resume message failed injection check."
+        )
+        if isinstance(result, dict):
+            return result
 
         return {}
 

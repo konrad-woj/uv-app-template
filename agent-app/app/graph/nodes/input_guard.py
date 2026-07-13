@@ -21,13 +21,12 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from logger import get_logger
-from pydantic import ValidationError
 
-from app.config import settings
 from app.graph.nodes._dead_letter import with_dead_letter
+from app.graph.nodes._guard_layers import run_sanitize_and_injection_check
 from app.graph.nodes._guard_verdict import GuardVerdict
-from app.graph.nodes._llm_invoke import llm_invoke_with_retry
-from app.graph.nodes._prompt_utils import sanitize_user_text
+from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
+from app.graph.nodes._messages import get_last_human_text
 from app.guards.gliguard import GLiGuardClient
 
 logger = get_logger(__name__)
@@ -53,27 +52,16 @@ def make_input_guard_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Calla
 
     @with_dead_letter("input_guard")
     async def input_guard(state: "AgentState", config: RunnableConfig) -> dict:  # type: ignore[name-defined]  # noqa: F821
-        last_human = next(
-            (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
-            None,
-        )
-        raw_text = str(last_human.content) if last_human else ""
+        raw_text = get_last_human_text(state["messages"])
         logger.info("input_guard.inputs", input_text_length=len(raw_text))
 
-        # Layer 1: regex sanitisation — blocks null bytes, XML injection markers, tool-call syntax.
-        try:
-            user_text = sanitize_user_text(raw_text)
-        except ValueError as exc:
-            logger.info("input_guard.layer1_blocked", reason=str(exc))
-            return {"status": "blocked", "guard_reason": f"Input rejected by sanitiser: {exc}"}
-        logger.info("input_guard.layer1_passed")
-
-        # Layer 2: GLiGuard — injection and jailbreak detection.
-        guard_result = await gliguard.acheck_input(user_text, settings.guard_timeout_seconds)
-        if guard_result.blocked:
-            logger.info("input_guard.layer2_blocked", reason=guard_result.reason)
-            return {"status": "blocked", "guard_reason": guard_result.reason or "Potential prompt injection detected."}
-        logger.info("input_guard.layer2_passed")
+        # Layers 1-2: regex sanitisation, then GLiGuard injection/jailbreak detection.
+        result = await run_sanitize_and_injection_check(
+            gliguard, raw_text, "input_guard", "Input", "Potential prompt injection detected."
+        )
+        if isinstance(result, dict):
+            return result
+        user_text = result
 
         # Layer 3: LLM topic relevance check (not safety — GLiGuard owns that).
         messages = [
@@ -81,9 +69,8 @@ def make_input_guard_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Calla
             HumanMessage(content=user_text),
         ]
         response = await llm_invoke_with_retry(llm, messages, config)
-        try:
-            verdict = GuardVerdict.model_validate_json(str(response.content))
-        except (ValidationError, ValueError):
+        verdict = parse_structured(str(response.content), GuardVerdict)
+        if verdict is None:
             logger.warning("input_guard.layer3_parse_failed")
             return {
                 "status": "blocked",

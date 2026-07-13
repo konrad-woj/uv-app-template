@@ -15,10 +15,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from logger import get_logger
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from app.graph.nodes._dead_letter import with_dead_letter
-from app.graph.nodes._llm_invoke import llm_invoke_with_retry
+from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
+from app.graph.nodes._messages import get_last_human_text
 
 logger = get_logger(__name__)
 
@@ -53,11 +54,7 @@ def make_writer_node(llm: BaseChatModel) -> Callable:
 
     @with_dead_letter("writer")
     async def writer(state: "AgentState", config: RunnableConfig) -> dict:  # type: ignore[name-defined]  # noqa: F821
-        last_human = next(
-            (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
-            None,
-        )
-        question = str(last_human.content) if last_human else ""
+        question = get_last_human_text(state["messages"])
         plan: list[str] = state.get("plan", [])  # type: ignore[assignment]
         logger.info(
             "writer.inputs",
@@ -73,11 +70,11 @@ def make_writer_node(llm: BaseChatModel) -> Callable:
         ]
         response = await llm_invoke_with_retry(llm, messages, config)
         raw = str(response.content)
-        try:
-            parsed = _WriterOutput.model_validate_json(raw)
+        parsed = parse_structured(raw, _WriterOutput)
+        if parsed is not None:
             draft = parsed.answer
             claims = parsed.claims
-        except (ValidationError, ValueError):
+        else:
             logger.warning("writer.parse_failed", raw_length=len(raw))
             draft = raw
             claims = []

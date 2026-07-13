@@ -31,6 +31,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_litellm import ChatLiteLLM
 from litellm.exceptions import APIConnectionError, APIError, RateLimitError, ServiceUnavailableError
 from logger import get_logger
+from pydantic import BaseModel, ValidationError
 
 from app.config import settings
 from app.exceptions import LLMError, LLMRateLimitError, LLMServiceError, LLMServiceUnavailableError
@@ -157,3 +158,16 @@ async def llm_invoke_with_retry(
             raise
 
     raise last_err  # type: ignore[misc]
+
+
+def parse_structured[T: BaseModel](raw: str, schema: type[T]) -> T | None:
+    """Parse an LLM response's raw text content as `schema`; return None on parse failure.
+
+    Every node that prompts an LLM for structured JSON follows the same
+    call-then-parse shape; this factors out just the parsing step so each
+    caller keeps its own fallback behaviour for the None case.
+    """
+    try:
+        return schema.model_validate_json(raw)
+    except (ValidationError, ValueError):
+        return None

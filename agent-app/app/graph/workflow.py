@@ -73,32 +73,31 @@ def _react_condition(state: AgentState) -> Literal["tools", "writer"]:
     return "tools" if getattr(last, "tool_calls", None) and not ceiling_hit else "writer"
 
 
-def _input_guard_condition(state: AgentState) -> Literal["planner", "dead_letter", "__end__"]:
-    """Route after input_guard: exception → dead_letter, blocked → END, safe → planner."""
+def _dead_letter_aware_route(state: AgentState, blocked_status: str, safe_route: str) -> str:
+    """Shared body for the four conditions below: exception → dead_letter, `blocked_status` → END, else `safe_route`."""
     if state.get("dead_letter"):
         return "dead_letter"
-    return "__end__" if state.get("status") == "blocked" else "planner"
+    return "__end__" if state.get("status") == blocked_status else safe_route
+
+
+def _input_guard_condition(state: AgentState) -> Literal["planner", "dead_letter", "__end__"]:
+    """Route after input_guard: exception → dead_letter, blocked → END, safe → planner."""
+    return _dead_letter_aware_route(state, "blocked", "planner")  # type: ignore[return-value]
 
 
 def _planner_condition(state: AgentState) -> Literal["plan_review", "dead_letter", "__end__"]:
     """Route after planner: exception → dead_letter, blocked → END, safe → plan_review."""
-    if state.get("dead_letter"):
-        return "dead_letter"
-    return "__end__" if state.get("status") == "blocked" else "plan_review"
+    return _dead_letter_aware_route(state, "blocked", "plan_review")  # type: ignore[return-value]
 
 
 def _plan_review_condition(state: AgentState) -> Literal["resume_guard", "dead_letter", "__end__"]:
     """Route after plan_review: exception → dead_letter, aborted → END, approved → resume_guard."""
-    if state.get("dead_letter"):
-        return "dead_letter"
-    return "__end__" if state.get("status") == "aborted" else "resume_guard"
+    return _dead_letter_aware_route(state, "aborted", "resume_guard")  # type: ignore[return-value]
 
 
 def _resume_guard_condition(state: AgentState) -> Literal["react_researcher", "dead_letter", "__end__"]:
     """Route after resume_guard: exception → dead_letter, blocked → END, safe → react_researcher."""
-    if state.get("dead_letter"):
-        return "dead_letter"
-    return "__end__" if state.get("status") == "blocked" else "react_researcher"
+    return _dead_letter_aware_route(state, "blocked", "react_researcher")  # type: ignore[return-value]
 
 
 def _make_run_verification(llm: BaseChatModel, fact_check_tool: BaseTool | None) -> Callable:

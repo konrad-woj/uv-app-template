@@ -29,12 +29,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 from logger import get_logger
-from pydantic import ValidationError
 
 from app.config import settings
 from app.graph.nodes._dead_letter import with_dead_letter
 from app.graph.nodes._guard_verdict import GuardVerdict
-from app.graph.nodes._llm_invoke import llm_invoke_with_retry
+from app.graph.nodes._llm_invoke import llm_invoke_with_retry, parse_structured
+from app.graph.nodes._messages import get_last_human_text
 from app.guards.gliguard import GLiGuardClient
 
 logger = get_logger(__name__)
@@ -60,12 +60,8 @@ def make_planner_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Callable:
 
     @with_dead_letter("planner")
     async def planner(state: "AgentState", config: RunnableConfig) -> dict:  # type: ignore[name-defined]  # noqa: F821
-        last_human = next(
-            (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
-            None,
-        )
-        user_text = last_human.content if last_human else ""
-        logger.info("planner.inputs", question_length=len(str(user_text)), message_count=len(state["messages"]))
+        user_text = get_last_human_text(state["messages"])
+        logger.info("planner.inputs", question_length=len(user_text), message_count=len(state["messages"]))
 
         messages = [
             SystemMessage(content=_PLAN_SYSTEM_PROMPT),
@@ -95,9 +91,8 @@ def make_planner_node(llm: BaseChatModel, gliguard: GLiGuardClient) -> Callable:
             HumanMessage(content=f"Research plan:\n{plan_as_text}"),
         ]
         guard_response = await llm_invoke_with_retry(llm, guard_messages, config)
-        try:
-            verdict = GuardVerdict.model_validate_json(str(guard_response.content))
-        except (ValidationError, ValueError):
+        verdict = parse_structured(str(guard_response.content), GuardVerdict)
+        if verdict is None:
             logger.warning("planner.guard_llm_parse_failed")
             return {
                 "plan": plan_steps,

@@ -15,6 +15,7 @@ into `create_score()` when Langfuse is configured (see run_experiment.py):
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -22,16 +23,24 @@ from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langfuse import Evaluation
 from logger import get_logger
-from pydantic import ValidationError
 
 from app.exceptions import LLMError
-from app.graph.nodes._llm_invoke import NodeLLMConfig, build_llm, llm_invoke_with_retry
+from app.graph.nodes._llm_invoke import NodeLLMConfig, build_llm, llm_invoke_with_retry, parse_structured
 from evals.models import RubricJudgeVerdict
 from evals.trace_assertions import evaluate_trace_assertions
 
 logger = get_logger(__name__)
 
 _JUDGE_CONFIG: RunnableConfig = {"configurable": {"thread_id": "quality-judge"}}
+
+# Judge models commonly wrap JSON in a ```json ... ``` fence despite "JSON only" instructions;
+# strip it before validation so a formatting quirk isn't conflated with a genuinely bad answer.
+_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
+
+
+def _strip_code_fences(text: str) -> str:
+    match = _CODE_FENCE_RE.match(text.strip())
+    return match.group(1) if match else text
 
 
 def turns_to_complete_evaluator(*, output: dict | None, expected_output: Any = None, **kwargs: Any) -> Evaluation:
@@ -137,10 +146,15 @@ async def run_quality_judge(
     prompt = _build_rubric_prompt(question, final_answer, criteria)
     try:
         response = await llm_invoke_with_retry(llm, [SystemMessage(content=prompt)], _JUDGE_CONFIG)
-        return RubricJudgeVerdict.model_validate_json(str(response.content))
-    except (LLMError, ValidationError, ValueError) as exc:
-        logger.warning("quality_judge.failed", error=str(exc))
+    except LLMError as exc:
+        logger.warning("quality_judge.call_failed", error=str(exc))
         return None
+
+    raw = _strip_code_fences(str(response.content))
+    verdict = parse_structured(raw, RubricJudgeVerdict)
+    if verdict is None:
+        logger.warning("quality_judge.unparseable_response", raw_length=len(raw))
+    return verdict
 
 
 def make_quality_score_evaluator(criteria: list[dict], judge_model: str | None) -> Callable:

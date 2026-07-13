@@ -97,8 +97,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         "planner": NodeLLMConfig(temperature=0.0),
         "react_researcher": NodeLLMConfig(temperature=0.0),
         "writer": NodeLLMConfig(temperature=0.3),
+        "verification": NodeLLMConfig(temperature=0.0),
         "reflection": NodeLLMConfig(temperature=0.2),
-        "output_guard": NodeLLMConfig(temperature=0.0),
     }
 
     async with AsyncConnectionPool(

@@ -52,6 +52,7 @@ import httpx
 import yaml
 from langchain_core.runnables import RunnableConfig
 from langfuse import Langfuse
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from logger import configure_logging, get_logger
 from pydantic import BaseModel, Field, ValidationError
 
@@ -99,17 +100,22 @@ class ExperimentConfig(BaseModel):
 
 
 def _validate_expected_outputs(dataset_file: str, items: list[dict]) -> None:
-    """Validate every item's expected_output against ExpectedOutput before the run starts.
+    """Validate every item has an `input` key and a schema-valid `expected_output`.
 
     Raises:
         ValueError: Naming the dataset file, item index, and item id/name for fast lookup —
-            a misspelled field must be obvious, not a silent no-op three layers downstream.
+            a missing key or misspelled field must be obvious, not a silent no-op or a raw
+            KeyError three layers downstream (an HTTP call or a Langfuse upload).
     """
     for i, item in enumerate(items):
+        label = item.get("id") or item.get("name") or f"index {i}"
+        if "input" not in item:
+            raise ValueError(f"{dataset_file}: item {i} ({label}) is missing required key 'input'")
+        if "expected_output" not in item:
+            raise ValueError(f"{dataset_file}: item {i} ({label}) is missing required key 'expected_output'")
         try:
             ExpectedOutput.model_validate(item["expected_output"])
         except ValidationError as exc:
-            label = item.get("id") or item.get("name") or f"index {i}"
             raise ValueError(f"{dataset_file}: item {i} ({label}) has an invalid expected_output: {exc}") from exc
 
 
@@ -165,8 +171,16 @@ async def _run_conversation(
     return last_response, turns, reached_interrupt
 
 
-def make_task(base_url: str, db_uri: str | None = None):
-    """Return a task function closed over `base_url` and `db_uri` (one per variant)."""
+def make_task(base_url: str, checkpointer: BaseCheckpointSaver):
+    """Return a task function closed over `base_url` and a shared `checkpointer` (one pool per variant).
+
+    The HTTP conversation and the Postgres history read are isolated in separate
+    try/except blocks: a transport failure never gets a history read attempted at
+    all (nothing to read yet), but a history-read failure *after* a successful HTTP
+    call must not discard the model's actual response and understate pass rates —
+    it's reported as a run with an empty history/final_state instead of a full
+    "task_error", which would otherwise mask a good answer behind a transient DB blip.
+    """
 
     async def task(*, item: dict, **kwargs: Any) -> dict:
         _ = kwargs
@@ -178,16 +192,14 @@ def make_task(base_url: str, db_uri: str | None = None):
         try:
             async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
                 response, turns, reached_interrupt = await _run_conversation(client, thread_id, messages, approve_plan)
-            history, final_state = await _read_history(thread_id, db_uri)
         except Exception as exc:
-            # Harness-integrity fix #1: never let a per-item failure (HTTP transport,
-            # or the Postgres history read that runs after a successful HTTP call)
+            # Harness-integrity fix #1: never let a per-item HTTP transport failure
             # propagate into the orchestration loop and silently shrink the result
             # count — return a scored failure instead. Broad `except Exception` is
             # deliberate here: this is a per-item isolation boundary in a batch job,
-            # not application code — one bad item (server down, DB unreachable,
-            # malformed response) must not take the rest of the run down with it.
-            logger.error("task.failed", thread_id=thread_id, error=str(exc), error_type=type(exc).__name__)
+            # not application code — one bad item (server down, malformed response)
+            # must not take the rest of the run down with it.
+            logger.error("task.http_failed", thread_id=thread_id, error=str(exc), error_type=type(exc).__name__)
             return {
                 "thread_id": thread_id,
                 "status": "task_error",
@@ -200,6 +212,15 @@ def make_task(base_url: str, db_uri: str | None = None):
                 "final_state": {},
                 "error": f"{type(exc).__name__}: {exc}",
             }
+
+        try:
+            history, final_state = await _read_history(checkpointer, thread_id)
+        except Exception as exc:
+            # A DB blip here must not discard a perfectly good model response — the
+            # HTTP-derived fields below are still reported; only the trace-dependent
+            # fields (history, final_state, and therefore trace_assertions) are empty.
+            logger.error("task.history_read_failed", thread_id=thread_id, error=str(exc), error_type=type(exc).__name__)
+            history, final_state = [], {}
 
         return {
             "thread_id": thread_id,
@@ -238,24 +259,26 @@ def make_task(base_url: str, db_uri: str | None = None):
 # ---------------------------------------------------------------------------
 
 
-async def _read_history(thread_id: str, db_uri: str | None = None) -> tuple[list[dict], dict]:
-    """Return (history, final_state): checkpoints newest-first + the newest checkpoint's values."""
-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+async def _read_history(checkpointer: BaseCheckpointSaver, thread_id: str) -> tuple[list[dict], dict]:
+    """Return (history, final_state): checkpoints newest-first + the newest checkpoint's values.
 
+    `checkpointer` is shared across every item in a variant's run (see `_run_variant`)
+    rather than opened fresh per item — one Postgres connection pool for the whole
+    variant instead of one connection per dataset item.
+    """
     from app.graph.workflow import create_graph
 
-    async with AsyncPostgresSaver.from_conn_string(db_uri or settings.db_uri) as checkpointer:
-        graph = create_graph().compile(checkpointer=checkpointer)
-        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-        history = [
-            {
-                "step": (snapshot.metadata or {}).get("step", 0),
-                "source": (snapshot.metadata or {}).get("source", ""),
-                "next": snapshot.next,
-                "values": snapshot.values,
-            }
-            async for snapshot in graph.aget_state_history(config)
-        ]
+    graph = create_graph().compile(checkpointer=checkpointer)
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    history = [
+        {
+            "step": (snapshot.metadata or {}).get("step", 0),
+            "source": (snapshot.metadata or {}).get("source", ""),
+            "next": snapshot.next,
+            "values": snapshot.values,
+        }
+        async for snapshot in graph.aget_state_history(config)
+    ]
     final_state = history[0]["values"] if history else {}
     return history, final_state
 
@@ -311,33 +334,50 @@ async def _run_variant(
     langfuse: Langfuse | None,
     db_uri: str | None,
 ) -> dict:
-    task_fn = make_task(variant.base_url, db_uri)
-    semaphore = asyncio.Semaphore(max_concurrency)
+    # One pooled checkpointer per variant, shared across every item's history read
+    # below — matches app/main.py's own lifespan pattern (AsyncConnectionPool +
+    # AsyncPostgresSaver(pool)) instead of each item opening and tearing down its
+    # own single Postgres connection. Bounding the pool to max_concurrency matches
+    # the same semaphore-limited number of items that can be mid-flight at once.
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg import AsyncConnection
+    from psycopg.rows import DictRow, dict_row
+    from psycopg_pool import AsyncConnectionPool
 
-    async def _run_one(item: dict) -> dict:
-        # The whole per-item pipeline (HTTP task + evaluators, including the
-        # quality_score_evaluator's own LLM-judge call) is throttled together —
-        # max_concurrency bounds concurrent *items*, not just the HTTP phase.
-        # Evaluating outside the semaphore would let judge-LLM calls for every
-        # item fire concurrently regardless of max_concurrency, defeating a
-        # setting a caller lowers specifically to respect a rate-limited backend.
-        async with semaphore:
-            output = await task_fn(item=item)
-            evaluations = []
-            for evaluator in evaluators:
-                result = evaluator(output=output, expected_output=item.get("expected_output"))
-                if asyncio.iscoroutine(result):
-                    result = await result
-                evaluations.append(result)
-        if langfuse is not None:
-            _upload_scores(langfuse, output["thread_id"], evaluations)
-        return {
-            "item_id": item.get("id"),
-            "output": output,
-            "evaluations": [{"name": e.name, "value": e.value, "comment": e.comment} for e in evaluations],
-        }
+    async with AsyncConnectionPool(
+        conninfo=db_uri or settings.db_uri,
+        max_size=max_concurrency,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+        connection_class=AsyncConnection[DictRow],
+    ) as pool:
+        checkpointer = AsyncPostgresSaver(pool)
+        task_fn = make_task(variant.base_url, checkpointer)
+        semaphore = asyncio.Semaphore(max_concurrency)
 
-    item_results = await asyncio.gather(*(_run_one(item) for item in items))
+        async def _run_one(item: dict) -> dict:
+            # The whole per-item pipeline (HTTP task + evaluators, including the
+            # quality_score_evaluator's own LLM-judge call) is throttled together —
+            # max_concurrency bounds concurrent *items*, not just the HTTP phase.
+            # Evaluating outside the semaphore would let judge-LLM calls for every
+            # item fire concurrently regardless of max_concurrency, defeating a
+            # setting a caller lowers specifically to respect a rate-limited backend.
+            async with semaphore:
+                output = await task_fn(item=item)
+                evaluations = []
+                for evaluator in evaluators:
+                    result = evaluator(output=output, expected_output=item.get("expected_output"))
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    evaluations.append(result)
+            if langfuse is not None:
+                _upload_scores(langfuse, output["thread_id"], evaluations)
+            return {
+                "item_id": item.get("id"),
+                "output": output,
+                "evaluations": [{"name": e.name, "value": e.value, "comment": e.comment} for e in evaluations],
+            }
+
+        item_results = await asyncio.gather(*(_run_one(item) for item in items))
 
     summary: dict[str, list[float]] = {}
     for item_result in item_results:

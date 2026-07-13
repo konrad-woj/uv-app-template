@@ -1,6 +1,12 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 MAX_REQUEST_MESSAGE_LEN = 4096
+
+
+def _not_blank(value: str, info: ValidationInfo) -> str:
+    if not value.strip():
+        raise ValueError(f"{info.field_name} must not be blank")
+    return value
 
 
 class ChatRequest(BaseModel):
@@ -8,19 +14,7 @@ class ChatRequest(BaseModel):
     message: str = Field(max_length=MAX_REQUEST_MESSAGE_LEN)
     approve: bool | None = None  # None = new turn; True/False = resume interrupt
 
-    @field_validator("message")
-    @classmethod
-    def message_must_not_be_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("message must not be blank")
-        return v
-
-    @field_validator("thread_id")
-    @classmethod
-    def thread_id_must_not_be_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("thread_id must not be blank")
-        return v
+    _validate_not_blank = field_validator("thread_id", "message")(_not_blank)
 
 
 class ChatResponse(BaseModel):
@@ -45,9 +39,4 @@ class CheckpointInfo(BaseModel):
 class ReplayRequest(BaseModel):
     checkpoint_id: str
 
-    @field_validator("checkpoint_id")
-    @classmethod
-    def checkpoint_id_must_not_be_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("checkpoint_id must not be blank")
-        return v
+    _validate_not_blank = field_validator("checkpoint_id")(_not_blank)
