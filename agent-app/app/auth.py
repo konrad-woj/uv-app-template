@@ -9,6 +9,8 @@ Usage in main.py:
     app.include_router(router, dependencies=[Depends(verify_api_key)])
 """
 
+import secrets
+
 from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
 
@@ -28,5 +30,5 @@ async def verify_api_key(api_key: str | None = Security(_api_key_header)) -> Non
     """
     if settings.api_key is None:
         return
-    if api_key != settings.api_key:
+    if api_key is None or not secrets.compare_digest(api_key, settings.api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")

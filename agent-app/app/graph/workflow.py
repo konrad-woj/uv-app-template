@@ -26,7 +26,6 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import ToolNode
 
 from app.config import settings
 from app.graph.nodes._dead_letter import after, dead_letter_node, with_dead_letter
@@ -34,7 +33,7 @@ from app.graph.nodes._llm_invoke import NodeLLMConfig, build_llm
 from app.graph.nodes.input_guard import make_input_guard_node
 from app.graph.nodes.output_guard import make_output_guard_node
 from app.graph.nodes.planner import make_plan_review_node, make_planner_node
-from app.graph.nodes.react_researcher import make_react_researcher_node_from_llm
+from app.graph.nodes.react_researcher import make_react_researcher_node_from_llm, make_tools_node
 from app.graph.nodes.resume_guard import make_resume_guard_node
 from app.graph.nodes.subgraphs.reflection import ReflectionState, build_reflection_subgraph
 from app.graph.nodes.subgraphs.verification import VerificationState, build_verify_subgraph
@@ -160,7 +159,7 @@ def _build_graph(
     graph.add_node(
         "react_researcher", make_react_researcher_node_from_llm(nlm.get("react_researcher", default_llm), mcp_tools)
     )
-    graph.add_node("tools", ToolNode(mcp_tools))
+    graph.add_node("tools", make_tools_node(mcp_tools))
     graph.add_node("writer", make_writer_node(nlm.get("writer", default_llm)))
     graph.add_node(
         "verify_subgraph",

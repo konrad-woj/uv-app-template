@@ -118,6 +118,17 @@ class Settings(BaseSettings):
             "Bounds RAM/VRAM use under concurrent traffic; excess calls queue on a semaphore."
         ),
     )
+    guard_load_timeout_seconds: float = Field(
+        default=120.0,
+        description=(
+            "Per-attempt timeout in seconds for downloading/loading the GLiGuard model at startup. "
+            "A stuck download is retried up to guard_load_retries times before startup fails."
+        ),
+    )
+    guard_load_retries: int = Field(
+        default=3,
+        description="Number of attempts to load the GLiGuard model at startup before startup fails.",
+    )
     readiness_check_timeout_seconds: float = Field(
         default=3.0,
         description="Timeout in seconds for the /ready endpoint's database connectivity check.",
@@ -146,6 +157,15 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, description="Bind port for the FastAPI app.")
     mcp_host: str = Field(default="0.0.0.0", description="Bind host for the MCP tool server.")
     mcp_port: int = Field(default=8001, description="Bind port for the MCP tool server.")
+    graceful_shutdown_timeout_seconds: int = Field(
+        default=25,
+        description=(
+            "On SIGTERM, uvicorn stops accepting new connections and waits up to this many "
+            "seconds for in-flight requests to finish before forcibly cancelling them and closing "
+            "the Postgres connection pool. Keep this below the deployment's terminationGracePeriodSeconds "
+            "(k8s default 30s) so the process exits cleanly on its own instead of being SIGKILLed."
+        ),
+    )
 
 
 settings = Settings()

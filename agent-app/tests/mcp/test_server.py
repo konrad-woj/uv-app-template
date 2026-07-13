@@ -2,10 +2,11 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastmcp import Client
 
-from app.mcp.server import fetch_url, mcp, web_search
+from app.mcp.server import fact_check, fetch_url, mcp, web_search
 from app.mcp.ssrf import _validate_url
 
 
@@ -52,6 +53,17 @@ class TestWebSearch:
             mock_ddgs.return_value.text.return_value = []
             result = await web_search("zzz_nonexistent_xyz")
         assert "No results found" in result
+
+    async def test_search_failure_is_logged_and_reraised(self) -> None:
+        with (
+            patch("app.mcp.server.DDGS") as mock_ddgs,
+            patch("app.mcp.server.logger") as mock_logger,
+        ):
+            mock_ddgs.return_value.text.side_effect = RuntimeError("DDG unavailable")
+            with pytest.raises(RuntimeError, match="DDG unavailable"):
+                await web_search("python")
+        mock_logger.exception.assert_called_once()
+        assert mock_logger.exception.call_args.kwargs["query"] == "python"
 
 
 def _mock_http_get(text: str) -> AsyncMock:
@@ -113,3 +125,59 @@ class TestFetchUrl:
     async def test_rejects_ssrf_url_before_making_request(self) -> None:
         with pytest.raises(ValueError, match="Blocked non-public IP"):
             await fetch_url("http://169.254.169.254/latest/meta-data/")
+
+    async def test_http_failure_is_logged_and_reraised(self) -> None:
+        failing_get = AsyncMock(side_effect=httpx.ConnectTimeout("timed out"))
+        with (
+            patch("app.mcp.server._http_client.get", failing_get),
+            patch("app.mcp.server.logger") as mock_logger,
+        ):
+            with pytest.raises(httpx.ConnectTimeout):
+                await fetch_url("https://example.com")
+        mock_logger.exception.assert_called_once()
+        assert mock_logger.exception.call_args.kwargs["url"] == "https://example.com"
+
+
+class TestFactCheck:
+    async def test_returns_snippets_and_enrichment(self) -> None:
+        fake_results = [{"title": "Claim source", "body": "Supporting evidence.", "href": "https://example.com"}]
+        with (
+            patch("app.mcp.server.DDGS") as mock_ddgs,
+            patch("app.mcp.server._http_client.get", _mock_http_get("Full article text.")),
+        ):
+            mock_ddgs.return_value.text.return_value = fake_results
+            result = await fact_check("The sky is blue.")
+        assert "Claim source" in result
+        assert "Full article text." in result
+
+    async def test_returns_no_evidence_message_when_empty(self) -> None:
+        with patch("app.mcp.server.DDGS") as mock_ddgs:
+            mock_ddgs.return_value.text.return_value = []
+            result = await fact_check("An obscure claim.")
+        assert "No evidence found" in result
+
+    async def test_search_failure_is_logged_and_reraised(self) -> None:
+        with (
+            patch("app.mcp.server.DDGS") as mock_ddgs,
+            patch("app.mcp.server.logger") as mock_logger,
+        ):
+            mock_ddgs.return_value.text.side_effect = RuntimeError("DDG unavailable")
+            with pytest.raises(RuntimeError, match="DDG unavailable"):
+                await fact_check("The sky is blue.")
+        mock_logger.exception.assert_called_once()
+        assert mock_logger.exception.call_args.kwargs["claim"] == "The sky is blue."
+
+    async def test_enrichment_failure_is_logged_but_snippets_still_returned(self) -> None:
+        fake_results = [{"title": "Claim source", "body": "Supporting evidence.", "href": "https://example.com"}]
+        failing_get = AsyncMock(side_effect=httpx.ConnectTimeout("timed out"))
+        with (
+            patch("app.mcp.server.DDGS") as mock_ddgs,
+            patch("app.mcp.server._http_client.get", failing_get),
+            patch("app.mcp.server.logger") as mock_logger,
+        ):
+            mock_ddgs.return_value.text.return_value = fake_results
+            result = await fact_check("The sky is blue.")
+        assert "Claim source" in result
+        assert "Full content from top source" not in result
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.warning.call_args.kwargs["url"] == "https://example.com"

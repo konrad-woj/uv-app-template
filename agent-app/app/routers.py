@@ -63,6 +63,7 @@ from langgraph.types import Command
 from app.config import settings
 from app.dependencies import get_graph
 from app.exceptions import LLMRateLimitError, LLMServiceError, LLMServiceUnavailableError
+from app.graph.nodes._dead_letter import dead_letter_counter
 from app.models import ChatRequest, ChatResponse, CheckpointInfo, ReplayRequest
 from app.rate_limit import limiter
 
@@ -118,6 +119,17 @@ async def ready(request: Request) -> JSONResponse:
     )
 
 
+@health_router.get("/metrics/dead-letter", tags=["meta"])
+async def dead_letter_metrics() -> dict:
+    """In-process count of dead-lettered runs since this pod started, by failed node.
+
+    Not a Prometheus/OTel metric — this app has no metrics backend. Exists so a
+    log/HTTP-based alert can key off a stable count instead of grepping error
+    strings. Resets on restart and is per-pod, not aggregated across replicas.
+    """
+    return {"total": dead_letter_counter.total, "by_node": dead_letter_counter.snapshot()}
+
+
 # ---------------------------------------------------------------------------
 # API router — authentication applied in main.py via include_router(dependencies=...)
 # ---------------------------------------------------------------------------
@@ -160,31 +172,41 @@ async def chat(
         "recursion_limit": settings.max_pipeline_steps,
     }
 
-    # Check if the thread is currently suspended at an interrupt.
-    snapshot = await graph.aget_state(config)
-    is_interrupted = bool(snapshot.next) and snapshot.values
+    # Everything below can raise the same LLM/DB/recursion errors the streaming
+    # endpoint already classifies via _classify_error — without this try/except
+    # they'd fall through to main.py's generic handler as an undifferentiated 500,
+    # hiding e.g. a rate limit or DB outage from callers and from status-code-based
+    # alerting/monitoring.
+    try:
+        # Check if the thread is currently suspended at an interrupt.
+        snapshot = await graph.aget_state(config)
+        is_interrupted = bool(snapshot.next) and snapshot.values
 
-    if is_interrupted:
-        if body.approve is None:
-            return ChatResponse(
-                thread_id=body.thread_id,
-                status="interrupted",
-                is_interrupted=True,
-                interrupt_value=_extract_interrupt_value(snapshot),
+        if is_interrupted:
+            if body.approve is None:
+                return ChatResponse(
+                    thread_id=body.thread_id,
+                    status="interrupted",
+                    is_interrupted=True,
+                    interrupt_value=_extract_interrupt_value(snapshot),
+                )
+            # Write the resume message to state so resume_guard can inspect it.
+            if body.message:
+                await graph.aupdate_state(config, {"messages": [HumanMessage(content=body.message)]})
+            result = await graph.ainvoke(Command(resume=body.approve), config)
+        else:
+            # Fresh turn: inject the new human message.
+            result = await graph.ainvoke(
+                {"messages": [HumanMessage(content=body.message)], "status": "planning"},
+                config,
             )
-        # Write the resume message to state so resume_guard can inspect it.
-        if body.message:
-            await graph.aupdate_state(config, {"messages": [HumanMessage(content=body.message)]})
-        result = await graph.ainvoke(Command(resume=body.approve), config)
-    else:
-        # Fresh turn: inject the new human message.
-        result = await graph.ainvoke(
-            {"messages": [HumanMessage(content=body.message)], "status": "planning"},
-            config,
-        )
 
-    # After invocation, check if the graph is now at a new interrupt.
-    post_snapshot = await graph.aget_state(config)
+        # After invocation, check if the graph is now at a new interrupt.
+        post_snapshot = await graph.aget_state(config)
+    except Exception as exc:
+        code, detail = _classify_error(exc)
+        raise HTTPException(status_code=code, detail=detail) from exc
+
     now_interrupted = bool(post_snapshot.next) and bool(post_snapshot.values)
 
     return ChatResponse(
@@ -376,12 +398,24 @@ async def replay(
         },
         "recursion_limit": settings.max_pipeline_steps,
     }
+    # Look up the checkpoint first so a bad/missing checkpoint_id (Postgres raises
+    # on a malformed UUID; an empty snapshot means no matching row) is always a 404,
+    # distinct from a real failure during replay execution below — a Postgres
+    # outage or LLM error there must not be misreported as "checkpoint not found",
+    # or it disappears from 5xx-based alerting.
+    try:
+        snapshot = await graph.aget_state(config)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {body.checkpoint_id}") from exc
+    if not snapshot.values:
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {body.checkpoint_id}")
+
     # None input = replay from checkpoint state; no new message injected.
     try:
         result = await graph.ainvoke(None, config)
     except Exception as exc:
-        # Postgres raises when checkpoint_id is not a valid UUID or doesn't exist.
-        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {body.checkpoint_id}") from exc
+        code, detail = _classify_error(exc)
+        raise HTTPException(status_code=code, detail=detail) from exc
     return ChatResponse(
         thread_id=thread_id,
         status=result.get("status", "done"),

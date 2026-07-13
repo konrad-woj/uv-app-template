@@ -9,9 +9,10 @@ Provides two validation layers:
 
 Usage in MCP tools:
     from app.mcp.ssrf import validate_url_and_host
-    validate_url_and_host(url)  # raises ValueError if blocked
+    await validate_url_and_host(url)  # raises ValueError if blocked
 """
 
+import asyncio
 import ipaddress
 import socket
 from urllib.parse import urlparse
@@ -47,12 +48,14 @@ def _validate_url(url: str) -> None:
         raise ValueError(f"Blocked non-public IP: {host}")
 
 
-def validate_url_and_host(url: str) -> str:
+async def validate_url_and_host(url: str) -> str:
     """Validate URL and resolve hostname to block DNS rebinding.
 
     Applies _validate_url first, then resolves the hostname via
-    socket.getaddrinfo and re-validates every returned IP address against
-    the same private/loopback/link-local block list.
+    socket.getaddrinfo (off the event loop, via asyncio.to_thread — a hung
+    resolver must not stall the MCP server's event loop) and re-validates
+    every returned IP address against the same private/loopback/link-local
+    block list.
 
     Note: this is a defense-in-depth measure, not a complete TOCTOU fix —
     the underlying HTTP client re-resolves DNS at connect time.
@@ -76,7 +79,7 @@ def validate_url_and_host(url: str) -> str:
     except ValueError:
         pass
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
     except socket.gaierror as exc:
         raise ValueError(f"Cannot resolve hostname: {host!r}") from exc
     for info in infos:

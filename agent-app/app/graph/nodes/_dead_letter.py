@@ -17,8 +17,10 @@ Usage:
     graph.add_conditional_edges("my_node", after("next_node"))
 """
 
+import threading
 import time
 import traceback
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypedDict
@@ -39,6 +41,39 @@ class DeadLetterInfo(TypedDict):
     error_message: str
     traceback: str
     timestamp: str  # ISO-8601
+
+
+class DeadLetterCounter:
+    """Thread-safe, in-process count of dead-lettered runs, by failed node.
+
+    Not a substitute for a real metrics backend (Prometheus, etc.) — this app has
+    none, and the count resets on restart / isn't aggregated across replicas. It
+    exists so a log-based alert (CloudWatch Logs Insights, Datadog log metrics,
+    Loki) can key off a stable numeric field instead of grepping error strings,
+    and so a single long-lived pod's dead-letter rate is visible without one.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_node: Counter[str] = Counter()
+
+    def increment(self, node_name: str) -> int:
+        """Record one dead-lettered run for `node_name`; return the new total across all nodes."""
+        with self._lock:
+            self._by_node[node_name] += 1
+            return self.total
+
+    @property
+    def total(self) -> int:
+        return sum(self._by_node.values())
+
+    def snapshot(self) -> dict[str, int]:
+        """Return a copy of the per-node counts (safe to log or serve from /ready-style endpoints)."""
+        with self._lock:
+            return dict(self._by_node)
+
+
+dead_letter_counter = DeadLetterCounter()
 
 
 def with_dead_letter(node_name: str) -> Callable:
@@ -82,6 +117,7 @@ def with_dead_letter(node_name: str) -> Callable:
                     "traceback": traceback.format_exc(),
                     "timestamp": datetime.now(tz=UTC).isoformat(),
                 }
+                total_dead_lettered = dead_letter_counter.increment(node_name)
                 logger.error(
                     "Node raised unhandled exception, routing to dead_letter",
                     node=node_name,
@@ -89,6 +125,8 @@ def with_dead_letter(node_name: str) -> Callable:
                     duration_ms=duration_ms,
                     error_type=type(exc).__name__,
                     error=str(exc),
+                    dead_letter_count_total=total_dead_lettered,
+                    dead_letter_count_by_node=dead_letter_counter.snapshot(),
                 )
                 return {"dead_letter": info, "status": "dead_lettered"}
 

@@ -22,6 +22,11 @@ from app.graph.nodes._llm_invoke import llm_invoke_with_retry
 
 logger = get_logger(__name__)
 
+# Hard ceiling on claims forwarded to verify_subgraph: each claim spawns a parallel
+# Send branch (tool call + LLM call), so this bounds fan-out width regardless of
+# what the writer LLM actually returns (the "3-5" in the prompt is not enforced by it).
+_MAX_CLAIMS = 5
+
 _SYSTEM_PROMPT = """You are a research writer. Given the user's research question,
 the research plan, and the gathered research context, write a comprehensive, well-structured answer.
 
@@ -76,6 +81,9 @@ def make_writer_node(llm: BaseChatModel) -> Callable:
             logger.warning("writer.parse_failed", raw_length=len(raw))
             draft = raw
             claims = []
+        if len(claims) > _MAX_CLAIMS:
+            logger.warning("writer.claims_truncated", claim_count=len(claims), max_claims=_MAX_CLAIMS)
+            claims = claims[:_MAX_CLAIMS]
         logger.info("writer.draft_produced", draft_length=len(draft), claim_count=len(claims))
         return {"draft_answer": draft, "claims": claims, "status": "writing"}
 

@@ -30,9 +30,12 @@ All limits are configurable via `AGENT_` env vars.
 | LLM timeout | `AGENT_LLM_TIMEOUT_SECONDS` | `60` | Single LLM call blocking the event loop indefinitely |
 | Retry with backoff | `AGENT_LLM_MAX_RETRIES` | `3` | Transient rate-limit / 5xx errors surfacing as failures immediately |
 | Global pipeline cap | `AGENT_MAX_PIPELINE_STEPS` | `50` | Routing bugs or unexpected loops consuming unbounded supersteps (`GraphRecursionError` on breach) |
-| MCP tool call timeout | `AGENT_MCP_TOOL_CALL_TIMEOUT_SECONDS` | `30` | A hung/slow MCP tool call (e.g. `fact_check` in `verify_subgraph`) blocking a branch indefinitely instead of routing to `dead_letter` |
+| MCP tool call timeout | `AGENT_MCP_TOOL_CALL_TIMEOUT_SECONDS` | `30` | A hung/slow MCP tool call blocking a branch indefinitely — applied to `fact_check` in `verify_subgraph` directly, and to every ReAct tool call (`web_search`, `fetch_url`, `fact_check`) via `ToolNode(awrap_tool_call=...)` in `react_researcher`'s `tools` node |
 | GLiGuard concurrency cap | `AGENT_GUARD_MAX_CONCURRENCY` | `4` | Unbounded concurrent forward passes through the single shared GLiGuard model exhausting host RAM or GPU VRAM under concurrent requests |
 | Postgres connection pool | `AGENT_DB_POOL_MAX_SIZE` | `20` | Concurrent requests serializing through a single checkpointer DB connection |
+| Guard input/output call timeout | `AGENT_GUARD_TIMEOUT_SECONDS` | `10` | A hung/slow GLiGuard classification call blocking a request indefinitely |
+| Guard model load retry | `AGENT_GUARD_LOAD_RETRIES` / `AGENT_GUARD_LOAD_TIMEOUT_SECONDS` | `3` / `120` | A stuck or transiently-failing HuggingFace model download hanging app startup forever with no diagnostic |
+| Graceful shutdown timeout | `AGENT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` | `25` | In-flight requests being cut off mid-response on SIGTERM, or the process hanging past the deployment's grace period and being SIGKILLed |
 
 ## Prerequisites
 
@@ -137,11 +140,14 @@ All agent variables use the `AGENT_` prefix. Defaults work for local development
 | `AGENT_GUARD_DEVICE` | `cpu` | Inference device for GLiGuard: `cpu`, `cuda`, or `mps` |
 | `AGENT_GUARD_TIMEOUT_SECONDS` | `10` | Per-call timeout for GLiGuard classification calls |
 | `AGENT_GUARD_MAX_CONCURRENCY` | `4` | Max concurrent GLiGuard inference calls; excess calls queue on a semaphore |
+| `AGENT_GUARD_LOAD_TIMEOUT_SECONDS` | `120` | Per-attempt timeout for downloading/loading the GLiGuard model at startup |
+| `AGENT_GUARD_LOAD_RETRIES` | `3` | Attempts to load the GLiGuard model at startup before startup fails |
 | `AGENT_READINESS_CHECK_TIMEOUT_SECONDS` | `3` | Timeout for the `/ready` endpoint's database connectivity check |
 | `AGENT_WEB_SEARCH_MAX_RESULTS` | `10` | Server-side cap on `max_results` for `web_search` and `fact_check` MCP tools |
-| `AGENT_API_KEY` | `None` | X-API-Key header value; when unset, auth is disabled (local dev) |
-| `AGENT_RATE_LIMIT` | `None` | slowapi limit string, e.g. `20/minute`; when unset, rate limiting is disabled |
+| `AGENT_API_KEY` | `None` | X-API-Key header value; when unset, auth is disabled (local dev). App logs a startup warning if unset. |
+| `AGENT_RATE_LIMIT` | `None` | slowapi limit string, e.g. `20/minute`; when unset, rate limiting is disabled. App logs a startup warning if unset. |
 | `AGENT_SSE_KEEPALIVE_SECONDS` | `15` | SSE ping interval to prevent proxy idle-timeout on long graph runs |
+| `AGENT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` | `25` | On SIGTERM, max seconds uvicorn waits for in-flight requests before cancelling them; keep below the deployment's `terminationGracePeriodSeconds` |
 | `AGENT_APP_HOST` | `0.0.0.0` | Bind host for the FastAPI app |
 | `AGENT_APP_PORT` | `8000` | Bind port for the FastAPI app |
 | `AGENT_MCP_HOST` | `0.0.0.0` | Bind host for the MCP tool server |
@@ -154,11 +160,18 @@ All agent variables use the `AGENT_` prefix. Defaults work for local development
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness probe |
+| `GET` | `/health` | Liveness probe — static, no dependency checks |
+| `GET` | `/ready` | Readiness probe — checks GLiGuard loaded, Postgres reachable, MCP tools loaded |
+| `GET` | `/metrics/dead-letter` | In-process count of dead-lettered runs since this pod started, by failed node |
 | `POST` | `/v1/chat` | Invoke the agent (first turn or interrupt resume); returns full response |
 | `POST` | `/v1/chat/stream` | Same as `/v1/chat` but streams writer tokens as SSE |
 | `GET` | `/v1/threads/{id}/history` | Full checkpoint list for a thread (time-travel) |
 | `POST` | `/v1/threads/{id}/replay` | Re-invoke from a named checkpoint |
+
+`/v1/chat` and `/v1/chat/stream` classify LLM/DB errors identically via the shared
+`_classify_error` helper (429 rate limit, 503 service unavailable, 502 service error,
+500 recursion-limit exceeded) — `/v1/chat` returns these as an `HTTPException`,
+`/v1/chat/stream` emits them as an `error` SSE frame with the same code/detail.
 
 ### SSE event types (`POST /v1/chat/stream`)
 

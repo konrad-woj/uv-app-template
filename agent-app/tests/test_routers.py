@@ -16,6 +16,7 @@ from langgraph.types import Command
 
 from app.dependencies import get_graph
 from app.exceptions import LLMRateLimitError
+from app.graph.nodes._dead_letter import dead_letter_counter
 from app.routers import _classify_error, _generate, health_router, router
 
 _app = FastAPI()
@@ -93,6 +94,37 @@ class TestHealth:
         response = await client.get("/health")
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics/dead-letter
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_dead_letter_counter_for_router_tests():
+    dead_letter_counter._by_node.clear()
+    yield
+    dead_letter_counter._by_node.clear()
+
+
+class TestDeadLetterMetrics:
+    async def test_returns_zero_counts_when_nothing_dead_lettered(self, client: AsyncClient) -> None:
+        response = await client.get("/metrics/dead-letter")
+        assert response.status_code == 200
+        assert response.json() == {"total": 0, "by_node": {}}
+
+    async def test_reflects_counter_state(self, client: AsyncClient) -> None:
+        dead_letter_counter.increment("planner")
+        dead_letter_counter.increment("planner")
+        dead_letter_counter.increment("writer")
+
+        response = await client.get("/metrics/dead-letter")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 3
+        assert data["by_node"] == {"planner": 2, "writer": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +254,70 @@ class TestChatFreshTurn:
         data = response.json()
         assert data["status"] == "dead_lettered"
         assert data["dead_letter"] == dead_letter_info
+
+
+class TestChatErrorClassification:
+    """/v1/chat must classify LLM/DB errors the same way /v1/chat/stream does via
+    _classify_error, instead of letting them fall through to a generic 500."""
+
+    async def test_rate_limit_error_returns_429(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        from app.exceptions import LLMRateLimitError
+
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot())
+        mock_graph.ainvoke = AsyncMock(side_effect=LLMRateLimitError("too many requests"))
+
+        response = await client.post("/v1/chat", json={"thread_id": "t-err-1", "message": "hi"})
+
+        assert response.status_code == 429
+        assert response.json()["detail"] == "LLM rate limit exceeded"
+
+    async def test_service_unavailable_error_returns_503(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        from app.exceptions import LLMServiceUnavailableError
+
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot())
+        mock_graph.ainvoke = AsyncMock(side_effect=LLMServiceUnavailableError("provider down"))
+
+        response = await client.post("/v1/chat", json={"thread_id": "t-err-2", "message": "hi"})
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "LLM service unavailable"
+
+    async def test_service_error_returns_502(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        from app.exceptions import LLMServiceError
+
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot())
+        mock_graph.ainvoke = AsyncMock(side_effect=LLMServiceError("unexpected provider error"))
+
+        response = await client.post("/v1/chat", json={"thread_id": "t-err-3", "message": "hi"})
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "LLM service error"
+
+    async def test_recursion_error_returns_500_with_specific_detail(
+        self, client: AsyncClient, mock_graph: MagicMock
+    ) -> None:
+        from langgraph.errors import GraphRecursionError
+
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot())
+        mock_graph.ainvoke = AsyncMock(side_effect=GraphRecursionError())
+
+        response = await client.post("/v1/chat", json={"thread_id": "t-err-4", "message": "hi"})
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Pipeline step limit exceeded"
+
+    async def test_initial_state_lookup_failure_is_classified(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        """A DB error on the pre-invoke aget_state call must also be classified, not just
+        errors from ainvoke — both hit the checkpointer and can fail the same way."""
+        from app.exceptions import LLMServiceUnavailableError
+
+        mock_graph.aget_state = AsyncMock(side_effect=LLMServiceUnavailableError("db down"))
+
+        response = await client.post("/v1/chat", json={"thread_id": "t-err-5", "message": "hi"})
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "LLM service unavailable"
+        mock_graph.ainvoke.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -402,12 +498,39 @@ class TestReplay:
         assert response.status_code == 422
 
     async def test_invalid_checkpoint_id_returns_404(self, client: AsyncClient, mock_graph: MagicMock) -> None:
-        mock_graph.ainvoke = AsyncMock(side_effect=Exception("invalid UUID"))
+        """Postgres raises on a malformed checkpoint_id UUID during the state lookup."""
+        mock_graph.aget_state = AsyncMock(side_effect=Exception("invalid input syntax for type uuid"))
 
         response = await client.post("/v1/threads/t-1/replay", json={"checkpoint_id": "not-a-uuid"})
 
         assert response.status_code == 404
         assert "not-a-uuid" in response.json()["detail"]
+        mock_graph.ainvoke.assert_not_called()
+
+    async def test_no_matching_checkpoint_returns_404(self, client: AsyncClient, mock_graph: MagicMock) -> None:
+        """A well-formed but nonexistent checkpoint_id returns an empty snapshot, not an exception."""
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot(values={}))
+
+        response = await client.post("/v1/threads/t-1/replay", json={"checkpoint_id": "cp-missing"})
+
+        assert response.status_code == 404
+        assert "cp-missing" in response.json()["detail"]
+        mock_graph.ainvoke.assert_not_called()
+
+    async def test_execution_failure_during_replay_is_classified_not_reported_as_404(
+        self, client: AsyncClient, mock_graph: MagicMock
+    ) -> None:
+        """A real failure while re-running the graph (e.g. LLM outage) must not be misreported
+        as "checkpoint not found" — that would hide a genuine incident from 5xx-based alerting."""
+        from app.exceptions import LLMServiceUnavailableError
+
+        mock_graph.aget_state = AsyncMock(return_value=_snapshot(values={"status": "planning"}))
+        mock_graph.ainvoke = AsyncMock(side_effect=LLMServiceUnavailableError("provider down"))
+
+        response = await client.post("/v1/threads/t-1/replay", json={"checkpoint_id": "cp-1"})
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "LLM service unavailable"
 
     async def test_dead_letter_info_surfaced_in_response(self, client: AsyncClient, mock_graph: MagicMock) -> None:
         dead_letter_info = {"failed_node": "input_guard", "error_type": "RuntimeError", "error_message": "boom"}

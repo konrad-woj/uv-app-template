@@ -1,9 +1,26 @@
 """Tests for react_researcher node."""
 
-from langchain_core.messages import AIMessage, ToolCall
+import asyncio
 
-from app.graph.nodes.react_researcher import make_react_researcher_node
+from langchain_core.messages import AIMessage, HumanMessage, ToolCall
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.prebuilt import ToolNode
+
+from app.graph.nodes.react_researcher import make_react_researcher_node, make_tools_node
 from tests.graph.nodes.conftest import CONFIG, base_state, make_mock_llm
+
+
+def _build_tools_test_graph(tools_node: ToolNode) -> CompiledStateGraph:
+    """Compile a minimal single-node graph so ToolNode gets the runtime context
+    (CONFIG_KEY_RUNTIME) it needs — invoking it standalone raises a config error."""
+    graph: StateGraph = StateGraph(MessagesState)
+    graph.add_node("tools", tools_node)
+    graph.add_edge(START, "tools")
+    graph.add_edge("tools", END)
+    return graph.compile(checkpointer=InMemorySaver())
 
 
 class TestReactResearcherNode:
@@ -50,3 +67,35 @@ class TestReactResearcherNode:
         result = await node(base_state(), CONFIG)
         assert result["status"] == "dead_lettered"
         assert result["dead_letter"]["failed_node"] == "react_researcher"
+
+
+class TestMakeToolsNode:
+    async def test_fast_tool_call_succeeds(self) -> None:
+        @tool
+        async def instant_tool(query: str) -> str:
+            """An instant tool."""
+            return f"result for {query}"
+
+        graph = _build_tools_test_graph(make_tools_node([instant_tool]))
+        message = AIMessage(content="", tool_calls=[ToolCall(name="instant_tool", args={"query": "x"}, id="call_1")])
+        result = await graph.ainvoke({"messages": [HumanMessage(content="hi"), message]}, CONFIG)
+        tool_message = result["messages"][-1]
+        assert tool_message.status != "error"
+        assert "result for x" in tool_message.content
+
+    async def test_hung_tool_call_times_out_as_error_message(self, monkeypatch) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "mcp_tool_call_timeout_seconds", 0.05)
+
+        @tool
+        async def hung_tool(query: str) -> str:
+            """A tool that never returns in time."""
+            await asyncio.sleep(1.0)
+            return "never gets here"
+
+        graph = _build_tools_test_graph(make_tools_node([hung_tool]))
+        message = AIMessage(content="", tool_calls=[ToolCall(name="hung_tool", args={"query": "x"}, id="call_1")])
+        result = await graph.ainvoke({"messages": [HumanMessage(content="hi"), message]}, CONFIG)
+        tool_message = result["messages"][-1]
+        assert tool_message.status == "error"

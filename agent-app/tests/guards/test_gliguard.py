@@ -244,3 +244,54 @@ class TestLoad:
         mock_cls.from_pretrained.assert_called_once_with("test-model")
         mock_model.to.assert_called_once_with("cpu")
         assert client._model is mock_model
+
+
+class TestALoad:
+    async def test_succeeds_on_first_attempt(self) -> None:
+        client = GLiGuardClient("test-model", "cpu")
+        with patch.object(client, "load") as mock_load:
+            await client.aload(timeout=5.0, retries=3, delay=0.01)
+        mock_load.assert_called_once()
+
+    async def test_retries_after_transient_failure_then_succeeds(self) -> None:
+        client = GLiGuardClient("test-model", "cpu")
+        with patch.object(client, "load", side_effect=[RuntimeError("network blip"), None]) as mock_load:
+            await client.aload(timeout=5.0, retries=3, delay=0.01)
+        assert mock_load.call_count == 2
+
+    async def test_raises_last_error_after_all_retries_exhausted(self) -> None:
+        client = GLiGuardClient("test-model", "cpu")
+        with patch.object(client, "load", side_effect=RuntimeError("download failed")) as mock_load:
+            with pytest.raises(RuntimeError, match="download failed"):
+                await client.aload(timeout=5.0, retries=3, delay=0.01)
+        assert mock_load.call_count == 3
+
+    async def test_raises_timeout_error_when_load_hangs(self) -> None:
+        client = GLiGuardClient("test-model", "cpu")
+
+        def _hang() -> None:
+            time.sleep(0.2)
+
+        with patch.object(client, "load", side_effect=_hang):
+            with pytest.raises(TimeoutError):
+                await client.aload(timeout=0.01, retries=1, delay=0.01)
+
+    async def test_does_not_block_event_loop_while_loading(self) -> None:
+        import asyncio
+
+        client = GLiGuardClient("test-model", "cpu")
+
+        def _slow_load() -> None:
+            time.sleep(0.2)
+
+        loop_ticks = 0
+
+        async def _tick_counter() -> None:
+            nonlocal loop_ticks
+            for _ in range(5):
+                await asyncio.sleep(0.02)
+                loop_ticks += 1
+
+        with patch.object(client, "load", side_effect=_slow_load):
+            await asyncio.gather(client.aload(timeout=5.0, retries=1, delay=0.01), _tick_counter())
+        assert loop_ticks == 5

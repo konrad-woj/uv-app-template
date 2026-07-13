@@ -2,7 +2,12 @@
 
 Lifecycle:
   startup  → load MCP tools, open a pooled AsyncPostgresSaver, load GLiGuardClient, compile graph.
-  shutdown → connection pool is closed via async context manager.
+  shutdown → on SIGTERM, uvicorn (via app/__main__.py's timeout_graceful_shutdown, sourced from
+             AGENT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS) stops accepting new connections and waits
+             for in-flight requests to finish — up to that timeout — before cancelling any still
+             running and invoking this module's shutdown phase, which closes the connection pool.
+             Keep the timeout below the deployment's terminationGracePeriodSeconds so the process
+             always exits cleanly on its own instead of being SIGKILLed mid-shutdown.
 
 The compiled graph is stored on app.state.graph and injected into endpoints
 via the get_graph() dependency (app/dependencies.py).
@@ -55,15 +60,35 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
+def _warn_if_insecure_defaults() -> None:
+    """Loudly flag opt-in security settings left at their permissive local-dev defaults.
+
+    AGENT_API_KEY and AGENT_RATE_LIMIT are deliberately unset by default so this
+    template runs out of the box for local dev and tests (see app/auth.py,
+    app/rate_limit.py) — that is not a bug and must not be forced to a required
+    field. But a real deployment left with either unset has authless / unlimited
+    endpoints with no signal in the logs, so warn loudly at startup instead.
+    """
+    if settings.api_key is None:
+        logger.warning(
+            "AGENT_API_KEY is unset — all /v1 endpoints are unauthenticated. Set it for any non-local deployment."
+        )
+    if settings.rate_limit is None:
+        logger.warning(
+            "AGENT_RATE_LIMIT is unset — graph-invoking endpoints have no rate limit. Set it for any non-local deployment."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     logger.info("Agent App starting")
+    _warn_if_insecure_defaults()
 
     mcp_tools = await load_mcp_tools(settings.mcp_server_url)
     logger.info("MCP tools loaded", tool_count=len(mcp_tools))
 
     gliguard = GLiGuardClient(settings.guard_model, settings.guard_device, settings.guard_max_concurrency)
-    gliguard.load()
+    await gliguard.aload(settings.guard_load_timeout_seconds, retries=settings.guard_load_retries)
     app.state.gliguard = gliguard
     logger.info("GLiGuard loaded", model=settings.guard_model, device=settings.guard_device)
 

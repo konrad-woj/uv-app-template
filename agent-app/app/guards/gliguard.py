@@ -150,6 +150,42 @@ class GLiGuardClient:
         self._model.to(self._device)
         logger.info("GLiGuard model loaded")
 
+    async def aload(self, timeout: float, retries: int = 3, delay: float = 5.0) -> None:
+        """Async, timeout-and-retry-bounded wrapper around load(), for use at app startup.
+
+        The HF download can hang on a network blip or transiently fail; without a
+        bound, a stuck download hangs app startup indefinitely with no diagnostic
+        beyond whatever eventually kills the process (e.g. a k8s startupProbe
+        timeout, with no log line explaining why). Runs load() in a worker thread
+        so it never blocks the event loop while (re)trying.
+
+        Args:
+            timeout: Per-attempt timeout in seconds.
+            retries: Number of attempts before raising the last error.
+            delay: Seconds to wait between attempts.
+
+        Raises:
+            The last exception encountered (TimeoutError on the final attempt's
+            timeout, or whatever load() raised) once retries are exhausted.
+        """
+        last_exc: Exception = RuntimeError("retries must be at least 1")
+        for attempt in range(max(retries, 0)):
+            try:
+                await asyncio.wait_for(asyncio.to_thread(self.load), timeout=timeout)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries - 1:
+                    logger.warning(
+                        "GLiGuard model load failed, retrying",
+                        attempt=attempt + 1,
+                        retries=retries,
+                        error=str(exc),
+                    )
+                    await asyncio.sleep(delay)
+        logger.error("GLiGuard model load failed after all retries", retries=retries, error=str(last_exc))
+        raise last_exc
+
     def check_input(self, text: str) -> GuardResult:
         """Classify user input for prompt injection and jailbreak attempts.
 

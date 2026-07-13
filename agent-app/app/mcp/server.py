@@ -17,11 +17,13 @@ import asyncio
 import httpx
 from duckduckgo_search import DDGS
 from fastmcp import FastMCP
+from logger import get_logger
 
 from app.config import settings
 from app.mcp.ssrf import validate_url_and_host
 
 mcp = FastMCP("research-tools")
+logger = get_logger(__name__)
 # Shared client so fetch_url/fact_check reuse one connection pool instead of
 # paying a fresh TCP/TLS handshake per call under load.
 _http_client = httpx.AsyncClient(follow_redirects=False)
@@ -35,7 +37,13 @@ async def web_search(query: str, max_results: int = 5) -> str:
         query: The search query string.
         max_results: The maximum number of results to return.
     """
-    results = await asyncio.to_thread(DDGS().text, query, max_results=min(max_results, settings.web_search_max_results))
+    try:
+        results = await asyncio.to_thread(
+            DDGS().text, query, max_results=min(max_results, settings.web_search_max_results)
+        )
+    except Exception:
+        logger.exception("web_search failed", query=query)
+        raise
     if not results:
         return f"No results found for: {query}"
     snippets = [f"- {r['title']}: {r['body']}" for r in results]
@@ -51,9 +59,13 @@ async def fetch_url(url: str, max_char: int = 4000, timeout: float = 15.0) -> st
         max_char: The maximum number of characters to fetch.
         timeout: The timeout in seconds.
     """
-    validate_url_and_host(url)
-    response = await _http_client.get(url, timeout=timeout)
-    response.raise_for_status()
+    await validate_url_and_host(url)
+    try:
+        response = await _http_client.get(url, timeout=timeout)
+        response.raise_for_status()
+    except Exception:
+        logger.exception("fetch_url failed", url=url)
+        raise
     return response.text[:max_char]
 
 
@@ -67,7 +79,11 @@ async def fact_check(claim: str) -> str:
     Args:
         claim: The specific factual claim to verify.
     """
-    results = await asyncio.to_thread(DDGS().text, f"fact check: {claim}", max_results=3)
+    try:
+        results = await asyncio.to_thread(DDGS().text, f"fact check: {claim}", max_results=3)
+    except Exception:
+        logger.exception("fact_check search failed", claim=claim)
+        raise
     if not results:
         return f"No evidence found for: {claim}"
     snippets = "\n".join(f"- {r['title']}: {r['body']}" for r in results)
@@ -75,12 +91,14 @@ async def fact_check(claim: str) -> str:
     extra = ""
     if top_url:
         try:
-            validate_url_and_host(top_url)
+            await validate_url_and_host(top_url)
             resp = await _http_client.get(top_url, timeout=10.0)
             resp.raise_for_status()
             extra = f"\n\nFull content from top source ({top_url}):\n{resp.text[:2000]}"
-        except Exception:
-            pass
+        except Exception as exc:
+            # Enrichment is best-effort — the search snippets above are still useful
+            # without it, so log and continue rather than failing the whole tool call.
+            logger.warning("fact_check enrichment fetch failed", url=top_url, error=str(exc))
     return snippets + extra
 
 
