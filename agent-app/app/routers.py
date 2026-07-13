@@ -264,7 +264,7 @@ async def _generate(
             if await request.is_disconnected():
                 return
 
-            if event["event"] == "on_chat_model_stream" and "writer" in event.get("tags", []):
+            if event["event"] == "on_chat_model_stream" and event.get("metadata", {}).get("langgraph_node") == "writer":
                 token = event["data"].get("chunk").content  # type: ignore[union-attr]
                 if isinstance(token, list):
                     token = "".join(b.get("text", "") for b in token if isinstance(b, dict) and b.get("type") == "text")

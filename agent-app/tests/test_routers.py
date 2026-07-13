@@ -569,9 +569,9 @@ def _parse_sse(text: str) -> list[dict]:
     return frames
 
 
-def _make_stream_event(content: str, tags: list[str]) -> dict:
+def _make_stream_event(content: str, node: str) -> dict:
     chunk = AIMessageChunk(content=content)
-    return {"event": "on_chat_model_stream", "tags": tags, "data": {"chunk": chunk}}
+    return {"event": "on_chat_model_stream", "metadata": {"langgraph_node": node}, "data": {"chunk": chunk}}
 
 
 def _astream(*events):
@@ -598,9 +598,9 @@ class TestChatStream:
             ]
         )
         events = [
-            _make_stream_event("The", ["writer"]),
-            _make_stream_event(" answer", ["writer"]),
-            _make_stream_event(" is here", ["writer"]),
+            _make_stream_event("The", "writer"),
+            _make_stream_event(" answer", "writer"),
+            _make_stream_event(" is here", "writer"),
         ]
         mock_graph.astream_events = MagicMock(return_value=_astream(*events))
 
@@ -651,7 +651,7 @@ class TestChatStream:
                 _snapshot(values={"status": "done", "final_answer": "Done"}),  # post-stream
             ]
         )
-        mock_graph.astream_events = MagicMock(return_value=_astream(_make_stream_event("Done", ["writer"])))
+        mock_graph.astream_events = MagicMock(return_value=_astream(_make_stream_event("Done", "writer")))
 
         response = await client.post(
             "/v1/chat/stream", json={"thread_id": "t-s4", "message": "approve", "approve": True}
@@ -712,10 +712,10 @@ class TestChatStream:
             ]
         )
         events = [
-            _make_stream_event("guard token", ["input_guard"]),
-            _make_stream_event("planner token", ["planner"]),
-            _make_stream_event("writer token", ["writer"]),
-            _make_stream_event("output token", ["output_guard"]),
+            _make_stream_event("guard token", "input_guard"),
+            _make_stream_event("planner token", "planner"),
+            _make_stream_event("writer token", "writer"),
+            _make_stream_event("output token", "output_guard"),
         ]
         mock_graph.astream_events = MagicMock(return_value=_astream(*events))
 
@@ -738,8 +738,8 @@ class TestChatStream:
         thinking_chunk = AIMessageChunk(content=[{"type": "thinking", "thinking": "internal reasoning"}])
         text_chunk = AIMessageChunk(content=[{"type": "text", "text": "Final answer"}])
         events = [
-            {"event": "on_chat_model_stream", "tags": ["writer"], "data": {"chunk": thinking_chunk}},
-            {"event": "on_chat_model_stream", "tags": ["writer"], "data": {"chunk": text_chunk}},
+            {"event": "on_chat_model_stream", "metadata": {"langgraph_node": "writer"}, "data": {"chunk": thinking_chunk}},
+            {"event": "on_chat_model_stream", "metadata": {"langgraph_node": "writer"}, "data": {"chunk": text_chunk}},
         ]
         mock_graph.astream_events = MagicMock(return_value=_astream(*events))
 
@@ -772,7 +772,7 @@ class TestChatStream:
         mock_graph = MagicMock()
         mock_graph.aget_state = AsyncMock(return_value=_snapshot(values={"status": "done"}))
 
-        events = [_make_stream_event(f"token {i}", ["writer"]) for i in range(10)]
+        events = [_make_stream_event(f"token {i}", "writer") for i in range(10)]
         mock_graph.astream_events = MagicMock(return_value=_astream(*events))
 
         mock_request = MagicMock()
